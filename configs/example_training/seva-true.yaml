@@ -126,11 +126,11 @@ model:
 data:
   target: seva.data.mvh_dataloader.MVHumanNetLoader
   params:
-    # root_dir: /workspace/datasetvol/mvhuman_data/mv_captures
-    # latents_dir: /workspace/datasetvol/mvhuman_data/mv_latents
-    root_dir: /home/stone/dev/datasets/mvhumannet_samples/mv_captures
+    root_dir: /workspace/datasetvol/mvhuman_data/mv_captures
+    latents_dir: /workspace/datasetvol/mvhuman_data/mv_latents
+    # root_dir: /home/stone/dev/datasets/mvhumannet_samples/mv_captures
     # colmap_dir: /home/stone/dev/datasets/dl3dv_samples/dl3dv-colmap-new/
-    latents_dir: /home/stone/dev/datasets/mvhumannet_samples/mv_latents
+    # latents_dir: /home/stone/dev/datasets/mvhumannet_samples/mv_latents
     batch_size: 2
     num_workers: 16
     num_images: 8
