@@ -649,8 +649,7 @@ class ImageLogger(Callback):
         # pl_module: Union[None, pl.LightningModule] = None,
     ):
         root = os.path.join(save_dir, "images", split)
-        ref_mask   = masks[0]
-        input_mask = masks[1]
+        input_mask = masks[0]
         components_for_diffmap = []
         for k in images:
             if isheatmap(images[k]):
@@ -681,9 +680,6 @@ class ImageLogger(Callback):
                         border_color = (247.0, 121.0, 132.0)  # red
                     else: # targets
                         border_color = (101.0, 174.0, 219.0)  # blue
-                    # if ref image, then should be green
-                    if ref_mask[i]:
-                        border_color = (0.0, 255.0, 0.0) # green
 
                     img = self.tensor_to_image(img) # (-1, 1) ->(0, 1)
                     bordered_img = self.add_colored_border(img, border_color, border_width=24)
@@ -798,14 +794,14 @@ class ImageLogger(Callback):
                 batch["clean_latent"] = x
 
                 if torch.any(batch["use_inconsistent"]).item():
-                    ic = pl_module._encode_inconsistent_images(batch["ic_rgb"], batch["ref_mask"], batch["clean_latent"])
+                    ic = pl_module._encode_inconsistent_images(batch["ic_rgb"], batch["clean_latent"])
                     # for target (not input/ref) frames, zero condition latents
                     ic[~batch["mask"]] = 0
                     rgb_ic = batch["ic_rgb"]
                 else:
                     # no conditioning (to be replaced by clean_latents for inputs)
                     ic = torch.zeros_like(batch["clean_latent"], device=pl_module.device)
-                    ic[batch["ref_mask"]] = batch["clean_latent"][batch["ref_mask"]]
+                    ic[batch["mask"]] = batch["clean_latent"][batch["mask"]]
                     rgb_ic = batch["frames"] # same thing as GTs in phase 1
 
                 # update the batch using this
@@ -813,7 +809,7 @@ class ImageLogger(Callback):
                     "replace": torch.cat([
                         batch["clean_latent"],
                         repeat(
-                            batch["ref_mask"],
+                            batch["mask"],
                             "b n -> b n 1 h w",
                             h=batch["concat"].shape[-2],
                             w=batch["concat"].shape[-1]
@@ -855,7 +851,7 @@ class ImageLogger(Callback):
                 # log to wandb stage
                 gt_images = batch["frames"][:N].to("cpu") # choose first N from B
                 rgb_ic = rgb_ic[:N].to("cpu")
-                ref_mask = batch["ref_mask"][:N].to("cpu") # put into CPU (when using CPU, otherwise GPU)
+                ref_mask = batch["mask"][:N].to("cpu") # put into CPU (when using CPU, otherwise GPU)
                 gt_images[~ref_mask] = rgb_ic[~ref_mask]
 
                 pre_images = {} # legacy name
@@ -891,7 +887,6 @@ class ImageLogger(Callback):
 
                 masks = []
                 # masks = batch["mask"] # (B, max_images) binary boolean tensor
-                masks.append(batch["ref_mask"].reshape(-1)[:N].detach().cpu()) # (B, max_images) binary boolean tensor
                 masks.append(batch["mask"].reshape(-1)[:N].detach().cpu()) # (B, max_images) binary boolean tensor
 
                 if is_train: # if was training previously, set it back

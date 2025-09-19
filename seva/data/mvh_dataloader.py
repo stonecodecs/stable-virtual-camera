@@ -495,34 +495,35 @@ class MVHumanNetDataset(Dataset):
             # masked_image = self.transform(masked_image) # ! moved transform to after random crop
             frames[i] = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])(masked_image)
 
+        # ! not used for this case
         # Sample input/target frame split
-        if not self.use_inconsistent:
-            num_input_frames = np.random.randint(1, self.num_images) # at least 1 input frame
-        else:
-            # NOTE: if use_ic, then we make it higher probability that all num_images are inputs
-            # meaning that input_frames_mask will be all 1, and ref_maks will be one-hot
-            # if input_frames_mask is 0 at any point (not max num_images case), then these will have no ic cond.
-            if np.random.rand() <= self.all_inputs_prob:
-                # more likely to have all inconsistent inputs (then reconstruct to target)
-                num_input_frames = self.num_images
-            else: # 20% chance to have some ic inputs and then new targets
-                num_input_frames = np.random.randint(1, self.num_images) # at least 1 input frame
+        # if not self.use_inconsistent:
+        #     num_input_frames = np.random.randint(1, self.num_images) # at least 1 input frame
+        # else:
+        #     # NOTE: if use_ic, then we make it higher probability that all num_images are inputs
+        #     # meaning that input_frames_mask will be all 1, and ref_maks will be one-hot
+        #     # if input_frames_mask is 0 at any point (not max num_images case), then these will have no ic cond.
+        #     if np.random.rand() <= self.all_inputs_prob:
+        #         # more likely to have all inconsistent inputs (then reconstruct to target)
+        #         num_input_frames = self.num_images
+        #     else: # 20% chance to have some ic inputs and then new targets
+        #         num_input_frames = np.random.randint(1, self.num_images) # at least 1 input frame
         
-        input_frames_indices = np.random.choice(self.num_images, num_input_frames, replace=False) 
+        input_frames_indices = np.random.choice(self.num_images, replace=False) # 1 input frame (int)
 
         # Create input/target masks (1: input/ 0: target)
         input_frames_mask = torch.zeros(self.num_images, dtype=torch.bool)
         input_frames_mask[input_frames_indices] = True
 
-        if not self.use_inconsistent: # phase 1
-            # since inputs are all consistent in dataset, we can use multiple "references"
-            ref_mask = input_frames_mask.clone()
-        else:
-            # inputs will all be inconsistent, and we can only fix to a "single reference"
-            ref_mask = torch.zeros(self.num_images, dtype=torch.bool)
-            fix_frame_idx = input_frames_indices[np.random.choice(len(input_frames_indices), 1).item()]
-            ref_mask[fix_frame_idx] = True # this becomes the fixed frame
-            # input_frames_mask = ref_mask.clone()
+        # if not self.use_inconsistent: # phase 1
+        #     # since inputs are all consistent in dataset, we can use multiple "references"
+        #     ref_mask = input_frames_mask.clone()
+        # else:
+        #     # inputs will all be inconsistent, and we can only fix to a "single reference"
+        #     ref_mask = torch.zeros(self.num_images, dtype=torch.bool)
+        #     fix_frame_idx = input_frames_indices[np.random.choice(len(input_frames_indices), 1).item()]
+        #     ref_mask[fix_frame_idx] = True # this becomes the fixed frame
+        #     # input_frames_mask = ref_mask.clone()
 
         if self.use_inconsistent:
             ic_paths = [path.replace("mv_captures", "relit_images").replace(".jpg", ".png") for path in sampled_image_paths]
@@ -534,7 +535,6 @@ class MVHumanNetDataset(Dataset):
             # ! NOTE: only works with IC-light; need to combine with InfU later (combine in filesystem or sample)
         else: # if not, then just 0 tensor
             ic_rgb = torch.zeros((self.num_images, 3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
-
 
         camera_mask = torch.ones(self.num_images, dtype=torch.bool)
 
@@ -630,14 +630,14 @@ class MVHumanNetDataset(Dataset):
 
         w2cs = torch.linalg.inv(c2ws)
         pluckers = get_plucker_coordinates(
-            extrinsics_src=w2cs[input_frames_indices[0]],
+            extrinsics_src=w2cs[input_frames_indices],
             extrinsics=w2cs,
             intrinsics=Ks.clone(),
             target_size=(self.target_shape[0] // self.downsample_factor, 
                          self.target_shape[1] // self.downsample_factor),
         )
 
-        concat = torch.cat( # binary masks (inp/tgt + ref) and pluckers
+        concat = torch.cat( # binary masks (inp/tgt [-removed ref]) and pluckers
             [
                 repeat(
                     input_frames_mask,
@@ -645,12 +645,7 @@ class MVHumanNetDataset(Dataset):
                     h=pluckers.shape[2],
                     w=pluckers.shape[3],
                 ),
-                repeat(
-                    ref_mask, 
-                    "n -> n 1 h w", 
-                    h=pluckers.shape[2],
-                    w=pluckers.shape[3] 
-                ),
+                # ref
                 pluckers,
             ],
             dim=1,
@@ -662,14 +657,8 @@ class MVHumanNetDataset(Dataset):
             replace = torch.cat(
                 [
                     clean_latents * self.scale_factor,
-                    # repeat(
-                    #     input_frames_mask,
-                    #     "n -> n 1 h w",
-                    #     h=pluckers.shape[2],
-                    #     w=pluckers.shape[3],
-                    # ),
                     repeat(
-                        ref_mask, 
+                        input_frames_mask, 
                         "n -> n 1 h w", 
                         h=pluckers.shape[2],
                         w=pluckers.shape[3] 
@@ -686,7 +675,6 @@ class MVHumanNetDataset(Dataset):
             output_dict = {
                 "clean_latent": clean_latents, # unscaled clean latents
                 "mask": input_frames_mask,
-                "ref_mask": ref_mask, # "one hot" mask for reference images 
                 # "ic_paths": ic_paths, # synthetic data paths
                 "ic_rgb": ic_rgb, # ! NOTE: normalized!
                 # "ic_bbox": rel_bbox, # for cropping ic latents

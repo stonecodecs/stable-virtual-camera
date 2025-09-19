@@ -185,13 +185,13 @@ class DiffusionEngine(pl.LightningModule):
 
         # encode ic latents from the paths (scales)
         if torch.any(batch["use_inconsistent"]).item():
-            ic = self._encode_inconsistent_images(batch["ic_rgb"], batch["ref_mask"], batch["clean_latent"])
+            ic = self._encode_inconsistent_images(batch["ic_rgb"], batch["mask"], batch["clean_latent"])
             # for target (not input/ref) frames, zero condition latents
             ic[~batch["mask"]] = 0
         else:
             # no conditioning (to be replaced by clean_latents for inputs)
             ic = torch.zeros_like(batch["clean_latent"], device=self.device)
-            ic[batch["ref_mask"]] = batch["clean_latent"][batch["ref_mask"]]
+            ic[batch["mask"]] = batch["clean_latent"][batch["mask"]]    
 
         # ensure for ref image, ic tensors should be replaced by clean latents 
         # add ic as conditioning in concat (along with clean + plucker + masks)
@@ -199,7 +199,7 @@ class DiffusionEngine(pl.LightningModule):
             "replace": torch.cat([
                 batch["clean_latent"],
                 repeat(
-                    batch["ref_mask"],
+                    batch["mask"],
                     "b n -> b n 1 h w",
                     h=batch["plucker"].shape[-2],
                     w=batch["plucker"].shape[-1]
@@ -212,11 +212,11 @@ class DiffusionEngine(pl.LightningModule):
     def _encode_inconsistent_images(
         self,
         ic_rgb: torch.Tensor,
-        ref_mask: torch.Tensor,
+        mask: torch.Tensor,
         clean_latent: torch.Tensor,
         chunk_size: int = 2
     ) -> torch.Tensor:
-        # TODO: optimize such that we only encode images that are needed using ref_mask
+        # TODO: optimize such that we only encode images that are needed using mask (not ref_mask anymore)
         old_chunk_size = self.en_and_decode_n_samples_a_time
         self.en_and_decode_n_samples_a_time = chunk_size # for logging, 2 images at a time to reduce fragmentation
         # load images from paths and convert to tensors
@@ -225,8 +225,8 @@ class DiffusionEngine(pl.LightningModule):
         with torch.no_grad():
             for i in range(B):
                 latents_out[i] = self.encode_first_stage(ic_rgb[i].to(self.device))
-            # replace latents with clean latents for ref images
-            latents_out[ref_mask] = clean_latent[ref_mask]
+            # replace latents with clean latents for input frames
+            latents_out[mask] = clean_latent[mask]
         self.en_and_decode_n_samples_a_time = old_chunk_size
         return latents_out # latents_out is in GPU, rgb_images in CPU
 

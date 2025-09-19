@@ -39,7 +39,7 @@ model:
           target: seva.model.Seva
           params:
             params:
-              in_channels: 16 # 11 + 5
+              in_channels: 15 # 10 + 5
               model_channels: 320  # for Seva.time_embed
               out_channels: 4
               num_frames: 8
@@ -55,7 +55,7 @@ model:
               ckpt_path: null
         self_attn_rank: 128
         cross_attn_rank: 256
-        alpha: 16.0
+        alpha: 64
         dropout: 0.0
         target_modules: ["TransformerBlockTimeMix", "MultiviewTransformer", "TransformerBlock"]
         keys_to_lora: ["q", "k", "v"]
@@ -101,7 +101,7 @@ model:
       target: sgm.modules.diffusionmodules.loss.StandardDiffusionLoss
       params:
         loss_weighting_config:
-          target: sgm.modules.diffusionmodules.loss_weighting.SimVSWeighting
+          target: sgm.modules.diffusionmodules.loss_weighting.SevaWeighting
         sigma_sampler_config:
           target: sgm.modules.diffusionmodules.sigma_sampling.DiscreteSampling
           params:
@@ -176,7 +176,7 @@ lightning:
         enable_autocast: False
         batch_frequency: 1000
         max_images: 8
-        increase_log_steps: False
+        increase_log_steps: True
         log_first_step: False
         log_images_kwargs:
           use_ema_scope: False
