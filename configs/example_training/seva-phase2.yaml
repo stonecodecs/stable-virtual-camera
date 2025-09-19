@@ -55,7 +55,8 @@ model:
               ckpt_path: null
         self_attn_rank: 128
         cross_attn_rank: 256
-        alpha: 64
+        alpha: 64.0
+        ff_rank: 128
         dropout: 0.0
         target_modules: ["TransformerBlockTimeMix", "MultiviewTransformer", "TransformerBlock"]
         keys_to_lora: ["q", "k", "v"]
