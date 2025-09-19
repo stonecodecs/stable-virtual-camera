@@ -794,7 +794,7 @@ class ImageLogger(Callback):
                 batch["clean_latent"] = x
 
                 if torch.any(batch["use_inconsistent"]).item():
-                    ic = pl_module._encode_inconsistent_images(batch["ic_rgb"], batch["clean_latent"])
+                    ic = pl_module._encode_inconsistent_images(batch["ic_rgb"], batch["mask"], batch["clean_latent"])
                     # for target (not input/ref) frames, zero condition latents
                     ic[~batch["mask"]] = 0
                     rgb_ic = batch["ic_rgb"]
