@@ -115,10 +115,12 @@ class MVHumanNetDataset(Dataset):
         white_background=False,
         step_size=60,
         preload_path=None,
-        synthetic_dataset_path=None,
+        iclight_dataset_path=None,
+        infu_dataset_path=None,
         crop_padding=60, # used to prevent clipping of the humans
         use_inconsistent=False,
         random_crop_prob=0.3, # probability of using random crop over maximal
+        ic_sampling_prob=0.7, # probability of randomly sampling from InfU over IC light
         fixed_sampling_ids=None,
     ):
         self.root_dir = root_dir             # directory of all subject directories
@@ -138,6 +140,7 @@ class MVHumanNetDataset(Dataset):
         # NOTE: if the above is set to True, then latents_dir will be ignored
         # and latents will be computed on the fly!
         self.use_inconsistent = use_inconsistent
+        self.ic_sampling_prob = ic_sampling_prob
         # if True, then will concatenate all clean latents with these ic latents
         # if False, then will leave conditioning "black" for target images
         # and will repeat the clean latent for the input images
@@ -160,7 +163,8 @@ class MVHumanNetDataset(Dataset):
         self.all_inputs_prob = 0.8
         self.white_background = white_background
         self.preload_path = preload_path
-        self.synthetic_dataset_path = synthetic_dataset_path # IC-light/InfU output directory
+        self.iclight_dataset_path = iclight_dataset_path # IC-light output directory
+        self.infu_dataset_path = infu_dataset_path # InfU output directory
         # if not None, will use the "phase 2" expected training process
 
         if self.num_images > 16: # if more than 16, disable trajectory NVS batching
@@ -428,6 +432,16 @@ class MVHumanNetDataset(Dataset):
                 })
         return scenes
 
+    def _get_infu_path(self, subject_id, timestep):
+        if self.infu_dataset_path is None:
+            return None
+        return self.infu_dataset_path + f"/{subject_id}/{timestep}_{subject_id}_img.png"
+
+    def _get_iclight_path(self, subject_id, timestep, camera):
+        if self.iclight_dataset_path is None:
+            return None
+        return self.iclight_dataset_path + f"/{subject_id}/{camera}/{timestep}_img.png"
+
     def __len__(self):
         return len(self.scenes)
     
@@ -525,10 +539,21 @@ class MVHumanNetDataset(Dataset):
             # input_frames_mask = ref_mask.clone()
 
         if self.use_inconsistent:
+            # get ic-light paths (corresponding to selected frame!)
             ic_paths = [path.replace("mv_captures", "relit_images").replace(".jpg", ".png") for path in sampled_image_paths]
+
+            # get infu paths (randomly sampled!)
+            infu_num_images_in_directory = len(os.listdir(self.infu_dataset_path + f"/{subject_id}"))
+            infu_random_indices = np.random.choice(infu_num_images_in_directory, self.num_images, replace=False)
+            infu_paths = [self._get_infu_path(subject_id, f"{infu_random_indices[i]:06d}") for i in range(self.num_images)]
+
+            # use a "mask" to determine which of the ic paths are from ic-light and which are from infu
+            ic_mask = torch.rand(self.num_images) <= self.ic_sampling_prob
+            ic_paths = [ic_paths[i] if ic_mask[i] else infu_paths[i] for i in range(self.num_images)]
+
             ic_rgb = []
             tensorize = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
-            for i, ic_path in enumerate(ic_paths):
+            for ic_path in ic_paths:
                 ic_image = Image.open(ic_path).convert("RGB")
                 ic_rgb.append(tensorize(ic_image)) # these can be different image shapes originally
             # ! NOTE: only works with IC-light; need to combine with InfU later (combine in filesystem or sample)
@@ -731,7 +756,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
         exclude: list = None,
         step_size: int = 150,
         preload_path: str = None,
-        synthetic_dataset_path: str = None,
+        iclight_dataset_path: str = None,
+        infu_dataset_path: str = None,
         random_crop: bool = False,
         maximal_crop: bool = True,
         val_include: list = None,
@@ -752,7 +778,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
         self.exclude = exclude
         self.step_size = step_size
         self.preload_path = preload_path
-        self.synthetic_dataset_path = synthetic_dataset_path
+        self.iclight_dataset_path = iclight_dataset_path
+        self.infu_dataset_path = infu_dataset_path
         self.random_crop = random_crop
         self.maximal_crop = maximal_crop
         self.val_include = val_include
@@ -793,7 +820,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 exclude=self.exclude,
                 step_size=self.step_size,
                 preload_path=self.preload_path,
-                synthetic_dataset_path=self.synthetic_dataset_path,
+                iclight_dataset_path=self.iclight_dataset_path,
+                infu_dataset_path=self.infu_dataset_path,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
@@ -813,7 +841,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 exclude=self.exclude,
                 step_size=self.step_size, # don't want too many samples for validation set
                 preload_path=self.preload_path,
-                synthetic_dataset_path=self.synthetic_dataset_path,
+                iclight_dataset_path=self.iclight_dataset_path,
+                infu_dataset_path=self.infu_dataset_path,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
@@ -831,7 +860,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 exclude=self.exclude,
                 step_size=self.step_size,
                 preload_path=self.preload_path,
-                synthetic_dataset_path=self.synthetic_dataset_path,
+                iclight_dataset_path=self.iclight_dataset_path,
+                infu_dataset_path=self.infu_dataset_path,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
