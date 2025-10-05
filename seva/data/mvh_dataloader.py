@@ -228,7 +228,7 @@ class MVHumanNetDataset(Dataset):
                 "extrinsics": <dict: camera extrinsics>
                 "intrinsics": <list: camera intrinsics>
                 "camera_scale": <float: camera scale>
-                "annots": {"bbox": <list: bbox coords.>, "bbox_face": <list: face bbox coords.>}
+                "annots": {"bbox": <list: bbox coords.>, "bbox_face": <list: face bbox coords. NOTE: not used since they're unreliable>}
             }
         }
         The above structure gives all that we need to load the filepaths (reducing metadata reads by a lot!)
@@ -290,7 +290,9 @@ class MVHumanNetDataset(Dataset):
             for timestep in iterator:
                 try: # to get all cameras for this timestep (and ENSURE all cameras are present)
                     for camera in cameras:
-                        time_id = timestep if is_list_type else f"{timestep * 5:04d}"
+                        if isinstance(timestep, str) and timestep.endswith("_img.jpg"):
+                            timestep = int(timestep.split("_")[0])
+                        time_id = f"{timestep * 5:04d}"
                         image_path = os.path.join(subject_path, "images_lr", camera, f"{time_id}_img.jpg")
                         mask_path = os.path.join(subject_path, "fmask_lr", camera, f"{time_id}_img_fmask.png")
                         # annots_path = os.path.join(subject_path, "annots", camera, f"{time_id}_img.json")
@@ -544,7 +546,7 @@ class MVHumanNetDataset(Dataset):
 
             # get infu paths (randomly sampled!)
             infu_num_images_in_directory = len(os.listdir(self.infu_dataset_path + f"/{subject_id}"))
-            infu_random_indices = np.random.choice(infu_num_images_in_directory, self.num_images, replace=False)
+            infu_random_indices = np.random.choice(infu_num_images_in_directory, self.num_images, replace=False) + 1
             infu_paths = [self._get_infu_path(subject_id, f"{infu_random_indices[i]:06d}") for i in range(self.num_images)]
 
             # use a "mask" to determine which of the ic paths are from ic-light and which are from infu
