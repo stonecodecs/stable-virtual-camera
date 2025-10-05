@@ -369,6 +369,7 @@ class ImageLogger(Callback):
         self.log_first_step = log_first_step
         self.log_before_first_step = log_before_first_step
         self.log_train = log_train
+        self.should_log_val = True
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         # for logging
         with torch.device("cpu"):
@@ -744,9 +745,15 @@ class ImageLogger(Callback):
     def log_img(self, pl_module, batch, batch_idx, split="train", sample=True): #pl_module: DiffusionEngine
         check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
 
+        # Determine which flag to check based on split
+        if split == "val":
+            should_log = self.should_log_val
+        else:
+            should_log = getattr(self, "should_log_now", False)
+
         # check if we should log at this batch index
         if (
-            getattr(self, "should_log_now", False)
+            should_log
             # self.check_frequency(check_idx)
             and hasattr(pl_module, "log_images")  # batch_idx % self.batch_freq == 0
             and callable(pl_module.log_images)
@@ -992,29 +999,27 @@ class ImageLogger(Callback):
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, *args, **kwargs
     ):
+        # NOTE: we always fully sample and log the images for the first validation batch!
         # if not self.disabled and pl_module.global_step > 0:
         if self.disabled:
             return
-        print(f"Logging validation at {pl_module.global_step}")
-        self.should_log_now = True
                 # All ranks enter the barrier before logging so collectives stay in order
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
         # Only rank 0 actually does the heavy GPU work
-        if trainer.is_global_zero and self.should_log_now:
+        if trainer.is_global_zero and self.should_log_val: # different var for val logs
             self.log_img(pl_module, batch, batch_idx, split="val")
 
         # All ranks wait again before continuing to next step
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-        self.should_log_now = False
-        # if hasattr(pl_module, "calibrate_grad_norm"):
-        #     if (
-        #         pl_module.calibrate_grad_norm and batch_idx % 25 == 0
-        #     ) and batch_idx > 0:
-        #         self.log_gradients(trainer, pl_module, batch_idx=batch_idx)
+        self.should_log_val = False
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        print("Resetting log_val to True for first-batch logging.")
+        self.should_log_val = True # reset for the next epoch (for first batch logging)
 
     # ! we disable testing for now, but otherwise, for distributed, we'd change this as well.
     @rank_zero_only

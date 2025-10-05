@@ -320,7 +320,6 @@ class DiffusionEngine(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # TODO: add this in in place of training image logs (not tested yet)
         loss, loss_dict = self.shared_step(batch)
         # log averaged validation loss; keep per-step metrics off
         val_dict = {f"val_{k}": v for k, v in loss_dict.items()}
