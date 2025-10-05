@@ -763,6 +763,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
         val_include: list = None,
         use_inconsistent: bool = False,
         random_crop_prob: float = 0.3,
+        ic_sampling_prob: float = 0.7,
         fixed_sampling_ids: list = None
     ):
         super().__init__()
@@ -785,6 +786,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
         self.val_include = val_include
         self.use_inconsistent = use_inconsistent
         self.random_crop_prob = random_crop_prob
+        self.ic_sampling_prob = ic_sampling_prob
         self.fixed_sampling_ids = fixed_sampling_ids
         # Define transforms
         # self.transform = T.Compose([
@@ -826,6 +828,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
                 random_crop_prob=self.random_crop_prob,
+                ic_sampling_prob=self.ic_sampling_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
             )
 
@@ -846,6 +849,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
+                ic_sampling_prob=self.ic_sampling_prob,
                 random_crop_prob=self.random_crop_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
             )
@@ -865,6 +869,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
+                ic_sampling_prob=self.ic_sampling_prob,
                 random_crop_prob=self.random_crop_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
             )
