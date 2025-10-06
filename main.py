@@ -713,15 +713,10 @@ class ImageLogger(Callback):
                 os.makedirs(os.path.split(path)[0], exist_ok=True)
                 img = Image.fromarray(grid)
                 img.save(path)
-                if exists(logger):
-                    assert isinstance(
-                        logger, WandbLogger
-                    ), "logger_log_image only supports WandbLogger currently"
+                if isinstance(logger, WandbLogger):
                     logger.log_image(
                         key=f"{split}/{k}",
-                        images=[
-                            img,
-                        ],
+                        images=[img],
                         step=global_step,
                     )
         if len(components_for_diffmap) == 2:
@@ -734,7 +729,7 @@ class ImageLogger(Callback):
             os.makedirs(os.path.split(path)[0], exist_ok=True)
             diffmap_img = Image.fromarray(diffmap)
             diffmap_img.save(path)
-            if exists(logger):
+            if isinstance(logger, WandbLogger):
                 logger.log_image(
                     key=f"{split}/diffmap",
                     images=[diffmap_img],
