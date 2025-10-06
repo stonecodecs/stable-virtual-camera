@@ -911,9 +911,18 @@ class ImageLogger(Callback):
                 #     pl_module.global_step, pl_module.current_epoch, batch_idx, pl_module
                 # )
 
+                # Resolve a robust save directory across different loggers
+                save_dir = getattr(pl_module.logger, "save_dir", None)
+                if not save_dir:
+                    save_dir = getattr(pl_module.logger, "log_dir", None)
+                if not save_dir and hasattr(pl_module, "trainer") and hasattr(pl_module.trainer, "logdir"):
+                    save_dir = pl_module.trainer.logdir
+                if not save_dir:
+                    save_dir = os.getcwd()
+
                 # add this iteration's images to the CPU-based logger queue
                 self._queue_log_task(
-                    pl_module.logger.save_dir, split, pre_images, masks,
+                    save_dir, split, pre_images, masks,
                     pl_module.global_step, pl_module.current_epoch, batch_idx, pl_module.logger, pl_module.scale_factor
                 )
             
