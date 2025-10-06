@@ -369,7 +369,7 @@ class ImageLogger(Callback):
         self.log_first_step = log_first_step
         self.log_before_first_step = log_before_first_step
         self.log_train = log_train
-        self.should_log_val = True
+        self.should_log_val = False
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         # for logging
         with torch.device("cpu"):
@@ -1022,8 +1022,8 @@ class ImageLogger(Callback):
         self.should_log_val = False
 
     def on_validation_epoch_start(self, trainer, pl_module):
-        print("Resetting log_val to True for first-batch logging.")
-        self.should_log_val = True # reset for the next epoch (for first batch logging)
+        pass # validation logging turned off for now
+        # self.should_log_val = True # reset for the next epoch (for first batch logging)
 
     # ! we disable testing for now, but otherwise, for distributed, we'd change this as well.
     @rank_zero_only
