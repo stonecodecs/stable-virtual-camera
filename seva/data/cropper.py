@@ -246,13 +246,13 @@ class RandomBBoxCropper(object):
             # scale this to target shape INTERNALLY (here)!
             face_bboxes_new = face_bboxes.to(torch.float32)  # Convert to float for arithmetic operations
             no_face_mask = face_bboxes[:,0] != -1
-            face_bboxes_new[no_face_mask, 0] = face_bboxes[no_face_mask, 0] - x1[no_face_mask]
-            face_bboxes_new[no_face_mask, 1] = face_bboxes[no_face_mask, 1] - y1[no_face_mask]
-            face_bboxes_new[no_face_mask, 2] = face_bboxes[no_face_mask, 2] - x1[no_face_mask]
-            face_bboxes_new[no_face_mask, 3] = face_bboxes[no_face_mask, 3] - y1[no_face_mask]
+            face_bboxes_new[no_face_mask, 0] = face_bboxes_new[no_face_mask, 0] - x1[no_face_mask].to(torch.float32)
+            face_bboxes_new[no_face_mask, 1] = face_bboxes_new[no_face_mask, 1] - y1[no_face_mask].to(torch.float32)
+            face_bboxes_new[no_face_mask, 2] = face_bboxes_new[no_face_mask, 2] - x1[no_face_mask].to(torch.float32)
+            face_bboxes_new[no_face_mask, 3] = face_bboxes_new[no_face_mask, 3] - y1[no_face_mask].to(torch.float32)
             face_bboxes_new[no_face_mask] = face_bboxes_new[no_face_mask] * (576.0 / torch.maximum((x2 - x1)[no_face_mask].to(torch.float32), (y2 - y1)[no_face_mask].to(torch.float32)).unsqueeze(-1)) # ! HARDCODED to 576
             face_bboxes_new[~no_face_mask] = -1 # just to ensure
-            face_bboxes = face_bboxes_new.to(torch.int32)  # Convert back to int32 for indexing
+            face_bboxes_new = face_bboxes_new.to(torch.int32)  # Convert back to int32 for indexing
 
         # perform the actual crop
         cropped_images = []

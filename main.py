@@ -963,25 +963,27 @@ class ImageLogger(Callback):
     # therefore, we don't use rank_zero_only and make other ranks wait for rank 0 to finish instead
     # @rank_zero_only
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if not self.log_train:
+        if not self.log_train or self.disabled:
             return # don't trigger any logs
-        check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
-        should_log = (
-            (not self.disabled)
-            and (pl_module.global_step > 0 or self.log_first_step)
-            and self.check_frequency(check_idx) # this mutates in-place, so it defines a self.should_log_now!
-        )
-        # All ranks enter the barrier before logging so collectives stay in order
-        if torch.distributed.is_available() and torch.distributed.is_initialized() and should_log:
-            torch.distributed.barrier()
 
-        # Only rank 0 actually does the heavy GPU work
-        if trainer.is_global_zero and should_log:
-            self.log_img(pl_module, batch, batch_idx, split="train")
+        should_log = 0.0
+        if trainer.is_global_zero:
+            check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
+            if (pl_module.global_step > 0 or self.log_first_step) and self.check_frequency(check_idx):
+                should_log = 1.0
 
-        # All ranks wait again before continuing to next step
-        if torch.distributed.is_available() and torch.distributed.is_initialized() and should_log:
-            torch.distributed.barrier()
+        should_log_tensor = torch.tensor(should_log, device=pl_module.device)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(should_log_tensor, src=0)
+
+        if should_log_tensor.item() == 1.0:
+            torch.distributed.barrier() # all ranks enter barrier when logging
+
+            if trainer.is_global_zero:
+                self.log_img(pl_module, batch, batch_idx, split="train")
+
+            torch.distributed.barrier() # all wait for rank 0, then continue
+
 
     def on_exception(self, trainer, pl_module, exception):
         self.shutdown()
@@ -999,7 +1001,6 @@ class ImageLogger(Callback):
     # same reason as on_train_batch_end
     # ! also note: validation set should only sample very few images per num_iterations (maybe 1 or 2)
     # ! otherwise very long wait times just for logging, slowing down training
-    @rank_zero_only
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, *args, **kwargs
     ):
@@ -1007,19 +1008,19 @@ class ImageLogger(Callback):
         # if not self.disabled and pl_module.global_step > 0:
         if self.disabled:
             return
-            
-        # All ranks enter the barrier before logging so collectives stay in order
-        if self.should_log_val:
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.barrier()
 
-            # Only rank 0 actually does the heavy GPU work
-            if trainer.is_global_zero and self.should_log_val: # different var for val logs
+        should_log = 1.0 if trainer.is_global_zero and self.should_log_val else 0.0
+        should_log_tensor = torch.tensor(should_log, device=pl_module.device)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(should_log_tensor, src=0)
+
+        if should_log_tensor.item() == 1.0:
+            torch.distributed.barrier() # all ranks enter barrier when logging
+
+            if trainer.is_global_zero and self.should_log_val:
                 self.log_img(pl_module, batch, batch_idx, split="val")
-
-            # All ranks wait again before continuing to next step
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.barrier()
+                
+            torch.distributed.barrier()
 
         self.should_log_val = False
 
