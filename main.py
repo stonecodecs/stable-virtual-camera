@@ -1007,17 +1007,19 @@ class ImageLogger(Callback):
         # if not self.disabled and pl_module.global_step > 0:
         if self.disabled:
             return
-                # All ranks enter the barrier before logging so collectives stay in order
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            
+        # All ranks enter the barrier before logging so collectives stay in order
+        if self.should_log_val:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
 
-        # Only rank 0 actually does the heavy GPU work
-        if trainer.is_global_zero and self.should_log_val: # different var for val logs
-            self.log_img(pl_module, batch, batch_idx, split="val")
+            # Only rank 0 actually does the heavy GPU work
+            if trainer.is_global_zero and self.should_log_val: # different var for val logs
+                self.log_img(pl_module, batch, batch_idx, split="val")
 
-        # All ranks wait again before continuing to next step
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            # All ranks wait again before continuing to next step
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.barrier()
 
         self.should_log_val = False
 
