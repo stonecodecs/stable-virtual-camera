@@ -77,6 +77,12 @@ class DiffusionEngine(pl.LightningModule):
             if loss_fn_config is not None
             else None
         )
+        
+        # Pass first_stage_model reference to loss for RGB decoding (if face perceptual loss is used)
+        if self.loss_fn is not None and hasattr(self.loss_fn, 'use_face_perceptual') and self.loss_fn.use_face_perceptual:
+            self.loss_fn.first_stage_model = self.first_stage_model
+            self.loss_fn.scale_factor = scale_factor
+            print(f"Face perceptual loss enabled: decoder and scale_factor ({scale_factor}) passed to loss_fn")
 
         self.use_ema = use_ema
         if self.use_ema:

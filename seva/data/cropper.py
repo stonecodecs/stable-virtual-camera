@@ -133,7 +133,7 @@ class RandomBBoxCropper(object):
             # x2_new = (center_x + (crop_size // 2) + self.padding[2]).int()
             # y2_new = (center_y + (crop_size // 2) + self.padding[3]).int()
 
-            # calculate relative bbox
+            # calculate relative bbox -- only needed for inconsistent images!
             rel_bbox[:, 0] = x1_new - x1 # d_x1
             rel_bbox[:, 1] = y1_new - y1 # d_y1
             rel_bbox[:, 2] = x2_new - x2 # d_x2
@@ -205,6 +205,7 @@ class RandomBBoxCropper(object):
         images: torch.Tensor, 
         bbox: torch.Tensor, 
         K: torch.Tensor,
+        face_bboxes: torch.Tensor = None,
         **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -212,7 +213,8 @@ class RandomBBoxCropper(object):
             images: Tensor of shape (B, C, H, W)
             bbox: Tensor of shape (B, 4) with [x1, y1, x2, y2]
             K: Intrinsics matrix of shape (B, 3, 3)
-
+            face_bboxes: Tensor of shape (B, 4) with [x1, y1, x2, y2]
+                - [-1, -1, -1, -1] used to indicate no face detected
         Returns:
             Cropped image and updated intrinsics matrix
         """
@@ -239,13 +241,22 @@ class RandomBBoxCropper(object):
         images, bbox = self._possibly_pad_img(images, x1, y1, x2, y2)
         x1, y1, x2, y2 = bbox.T
 
+        if face_bboxes is not None:
+            # reposition face wrt new corner point
+            # scale this to target shape INTERNALLY (here)!
+            face_bboxes[:, 0] = face_bboxes[:, 0] - x1
+            face_bboxes[:, 1] = face_bboxes[:, 1] - y1
+            face_bboxes[:, 2] = face_bboxes[:, 2] - x1
+            face_bboxes[:, 3] = face_bboxes[:, 3] - y1
+            face_bboxes = face_bboxes * (576.0 / max(x2 - x1, y2 - y1)) # ! HARDCODED to 576
+
         # perform the actual crop
         cropped_images = []
         for i in range(len(images)):
             cropped_img = images[i][:, int(y1[i]):int(y2[i]), int(x1[i]):int(x2[i])]
             cropped_images.append(cropped_img)
 
-        return cropped_images, K_new, rel_bbox
+        return cropped_images, K_new, rel_bbox, face_bboxes if face_bboxes is not None else None
 
 
 def percent_to_absolute(arr, abs_arr):
