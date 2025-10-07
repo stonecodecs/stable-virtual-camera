@@ -174,8 +174,8 @@ class MVHumanNetDataset(Dataset):
         self.crop_padding = crop_padding
         # actual data
         self.cam_params = {} # Dict[subject: (extrinsics, intrinsics, camera_scale)]
+        self.face_bboxes = self._load_face_bboxes() if face_bbox_dir is not None else None # * needs to be loaded BEFORE scenes!
         self.scenes = self._load_scenes() if preload_path is None else self._load_preloaded_filepaths()
-        self.face_bboxes = self._load_face_bboxes() if face_bbox_dir is not None else None
         self.image_shape = (1500, 2048) # MVHumanNet images are 2048x1500
 
         # from SD 2.1 VAE
@@ -321,10 +321,13 @@ class MVHumanNetDataset(Dataset):
                         mask_path = os.path.join(subject_path, "fmask_lr", camera, f"{time_id}_img_fmask.png")
                         # annots_path = os.path.join(subject_path, "annots", camera, f"{time_id}_img.json")
                         bbox = annots['bbox'][camera][time_id]
-                        face_bbox_dict = self.face_bboxes[subject][camera][time_id] # ['bbox_face']
-                        face_bbox = [face_bbox_dict['x1'], face_bbox_dict['y1'], face_bbox_dict['x2'], face_bbox_dict['y2']]
+                        face_bbox_dict = self.face_bboxes[subject][camera][f"{time_id}_img.jpg"] # ['bbox_face']
+                        if face_bbox_dict == {}:
+                            face_bbox = [-1, -1, -1, -1] # indicates no face detected
+                        else:
+                            face_bbox = [face_bbox_dict['x1'], face_bbox_dict['y1'], face_bbox_dict['x2'], face_bbox_dict['y2']]
 
-                        if (bbox[2] - bbox[0]) == 0 or (bbox[3] - bbox[1]) == 0:
+                        if face_bbox_dict != {} and ((bbox[2] - bbox[0]) == 0 or (bbox[3] - bbox[1]) == 0):
                             print(f"Skipping subject {subject} camera {camera} timestep {timestep} because bbox is invalid")
                             continue
 
@@ -614,27 +617,21 @@ class MVHumanNetDataset(Dataset):
         if self.random_crop or self.maximal_crop:
             annots_jsons = [frames_info[cam]["annots"] for cam in camera_order]
             crop_params = []
+            face_bboxes_adjusted = []
             for annots_json in annots_jsons:
                 bbox = annots_json['bbox'][:4]
+                face_bbox = annots_json['bbox_face'][:4] # this is from facebbox dir
                 crop_params.append(bbox)
+                face_bboxes_adjusted.append(face_bbox)
             # account for mvhn downsampling (hence the 0.5)
             # ! big HACK: after 103000+, the annotations are not scaled by 0.5 anymore!
             bbox_annot_scale = 0.5 if int(subject_id) < 103000 else 1.0
             bbox_params = torch.stack([torch.tensor(bbox) * bbox_annot_scale for bbox in crop_params])
 
-            # face bboxes
-            face_bboxes_adjusted = []
-            face_bboxes = [self.face_bboxes[subject_id][camera][timestep] for camera in camera_order] # [T, 4]
-            for face_bbox in face_bboxes:
-                if face_bbox == {}:
-                    # -1 used to indicate no face detected
-                    face_bboxes_adjusted.append([-1, -1, -1, -1])
-                else:
-                    face_bboxes_adjusted.append([face_bbox['x1'], face_bbox['y1'], face_bbox['x2'], face_bbox['y2']])
             # account for mvhn downsampling (hence the 0.5)
             # ! big HACK: after 103000+, the annotations are not scaled by 0.5 anymore!
             face_params = torch.stack([torch.tensor(face_bbox) for face_bbox in face_bboxes_adjusted])
-            frames, Ks, rel_bbox, face_bboxes_adjusted = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=pace_params)
+            frames, Ks, rel_bbox, face_bboxes_adjusted = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=face_params)
             # NOTE: rel_bbox is the delta from the deterministic crop to the random crop
             # this would then be all 0 if not using random_crop
             # for ic-light, we would later need to scale these by the scale factor (1024->576)
@@ -657,14 +654,16 @@ class MVHumanNetDataset(Dataset):
             Ks = repeat(Ks, 'd1 d2 -> n d1 d2', n=self.num_images) # assumes all intrinsics are the same 
             Ks = torch.from_numpy(Ks).float()
             # face bboxes can be found
+            annots_jsons = [frames_info[cam]["annots"] for cam in camera_order]
             face_bboxes_adjusted = []
-            face_bboxes = [self.face_bboxes[subject_id][camera][timestep] for camera in camera_order] # [T, 4]
-            for face_bbox in face_bboxes:
-                if face_bbox == {}:
-                    # -1 used to indicate no face detected
-                    face_bboxes_adjusted.append([-1, -1, -1, -1])
-                else:
-                    face_bboxes_adjusted.append([face_bbox['x1'], face_bbox['y1'], face_bbox['x2'], face_bbox['y2']])
+            for annots_json in annots_jsons:
+                face_bbox = annots_json['bbox_face'][:4] # this is from facebbox dir
+                face_bboxes_adjusted.append(face_bbox)
+                if face_bbox != [-1, -1, -1, -1]:
+                    # x1,x2 are affected by the center crop
+                    # ! assumes center crop is always horizontal (HARDCODED)
+                    face_bbox[0] = face_bbox[0] - crop_amount
+                    face_bbox[2] = face_bbox[2] - crop_amount
             # account for mvhn downsampling (hence the 0.5)
             # ! big HACK: after 103000+, the annotations are not scaled by 0.5 anymore!
             face_params = torch.stack([torch.tensor(face_bbox) for face_bbox in face_bboxes_adjusted])
