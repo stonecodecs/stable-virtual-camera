@@ -999,7 +999,7 @@ class ImageLogger(Callback):
     # same reason as on_train_batch_end
     # ! also note: validation set should only sample very few images per num_iterations (maybe 1 or 2)
     # ! otherwise very long wait times just for logging, slowing down training
-    # @rank_zero_only
+    @rank_zero_only
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, *args, **kwargs
     ):
