@@ -142,74 +142,74 @@ class StandardDiffusionLoss(nn.Module):
         else:
             raise NotImplementedError(f"Unknown loss type {self.loss_type}")
 
-def get_face_crop_perceptual_loss(
-    self,
-    model_output: torch.Tensor,  # Predicted latents [B, T, C, H, W]
-    target: torch.Tensor,        # Target latents [B, T, C, H, W] (not used, gt_frames is used instead)
-    batch: Dict,
-) -> torch.Tensor:
-    """
-    Compute perceptual loss on face-cropped regions in RGB space.
-    1. Decodes full latents to full RGB images.
-    2. Crops face regions from the decoded RGB images and ground-truth frames.
-    3. Resizes all crops to a uniform size.
-    4. Computes LPIPS loss on the RGB face crops.
-    """
-    # Check if decoder is available
-    if self.first_stage_model is None or self.scale_factor is None:
-        raise RuntimeError(
-            "first_stage_model and scale_factor must be set before using face perceptual loss."
-        )
+    def get_face_crop_perceptual_loss(
+        self,
+        model_output: torch.Tensor,  # Predicted latents [B, T, C, H, W]
+        target: torch.Tensor,        # Target latents [B, T, C, H, W] (not used, gt_frames is used instead)
+        batch: Dict,
+    ) -> torch.Tensor:
+        """
+        Compute perceptual loss on face-cropped regions in RGB space.
+        1. Decodes full latents to full RGB images.
+        2. Crops face regions from the decoded RGB images and ground-truth frames.
+        3. Resizes all crops to a uniform size.
+        4. Computes LPIPS loss on the RGB face crops.
+        """
+        # Check if decoder is available
+        if self.first_stage_model is None or self.scale_factor is None:
+            raise RuntimeError(
+                "first_stage_model and scale_factor must be set before using face perceptual loss."
+            )
 
-    B, T, C, H, W = model_output.shape
-    
-    # Unscale the predicted latents before decoding (taken care of by first_stage_model)
-    # model_output_unscaled = model_output / self.scale_factor
-    
-    # Reshape for decoding: [B*T, C, H, W]
-    # Gradients need to flow through the predicted RGBs
-    pred_rgbs_flat = self.first_stage_model.decode(model_output.reshape(B * T, C, H, W))
-    gt_rgbs_flat = batch["frames"].reshape(B * T, 3, pred_rgbs_flat.shape[2], pred_rgbs_flat.shape[3])
-    
-    # Get face bounding boxes and flatten them
-    face_bboxes_flat = batch["face_bbox"].reshape(B * T, 4)
-
-    cropped_pred_rgbs = []
-    cropped_gt_rgbs = []
-
-    # 2. Loop through the batch to CROP the RGB images
-    for i in range(B * T):
-        x1, y1, x2, y2 = face_bboxes_flat[i].long()
+        B, T, C, H, W = model_output.shape
         
-        # Skip invalid bboxes (-1 placeholder and others)
-        if x1 >= x2 or y1 >= y2 or x1 < 0:
-            continue
+        # Unscale the predicted latents before decoding (taken care of by first_stage_model)
+        # model_output_unscaled = model_output / self.scale_factor
+        
+        # Reshape for decoding: [B*T, C, H, W]
+        # Gradients need to flow through the predicted RGBs
+        pred_rgbs_flat = self.first_stage_model.decode(model_output.reshape(B * T, C, H, W))
+        gt_rgbs_flat = batch["frames"].reshape(B * T, 3, pred_rgbs_flat.shape[2], pred_rgbs_flat.shape[3])
+        
+        # Get face bounding boxes and flatten them
+        face_bboxes_flat = batch["face_bbox"].reshape(B * T, 4)
+
+        cropped_pred_rgbs = []
+        cropped_gt_rgbs = []
+
+        # 2. Loop through the batch to CROP the RGB images
+        for i in range(B * T):
+            x1, y1, x2, y2 = face_bboxes_flat[i].long()
             
-        # Crop the face region directly from the full RGB images
-        pred_crop = pred_rgbs_flat[i:i+1, :, y1:y2, x1:x2]
-        gt_crop = gt_rgbs_flat[i:i+1, :, y1:y2, x1:x2]
+            # Skip invalid bboxes (-1 placeholder and others)
+            if x1 >= x2 or y1 >= y2 or x1 < 0:
+                continue
+                
+            # Crop the face region directly from the full RGB images
+            pred_crop = pred_rgbs_flat[i:i+1, :, y1:y2, x1:x2]
+            gt_crop = gt_rgbs_flat[i:i+1, :, y1:y2, x1:x2]
+            
+            cropped_pred_rgbs.append(pred_crop)
+            cropped_gt_rgbs.append(gt_crop)
+
+        # If no valid faces were found in the batch, return zero loss
+        if not cropped_pred_rgbs:
+            return torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
+
+        # 3. Resize all collected RGB crops to a uniform size for LPIPS
+        resized_pred_crops = torch.cat([
+            F.interpolate(crop, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
+            for crop in cropped_pred_rgbs
+        ], dim=0)
         
-        cropped_pred_rgbs.append(pred_crop)
-        cropped_gt_rgbs.append(gt_crop)
+        resized_gt_crops = torch.cat([
+            F.interpolate(crop, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
+            for crop in cropped_gt_rgbs
+        ], dim=0)
 
-    # If no valid faces were found in the batch, return zero loss
-    if not cropped_pred_rgbs:
-        return torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
-
-    # 3. Resize all collected RGB crops to a uniform size for LPIPS
-    resized_pred_crops = torch.cat([
-        F.interpolate(crop, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
-        for crop in cropped_pred_rgbs
-    ], dim=0)
-    
-    resized_gt_crops = torch.cat([
-        F.interpolate(crop, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
-        for crop in cropped_gt_rgbs
-    ], dim=0)
-
-    # 4. Compute LPIPS loss on the batched, resized RGB crops
-    lpips_loss = self.lpips(resized_pred_crops, resized_gt_crops)
-    return lpips_loss.mean()
+        # 4. Compute LPIPS loss on the batched, resized RGB crops
+        lpips_loss = self.lpips(resized_pred_crops, resized_gt_crops)
+        return lpips_loss.mean()
 
 def interpolate_weights_batch(bools: torch.Tensor, max_weight=5.0) -> torch.Tensor:
     B, N = bools.shape
