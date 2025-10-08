@@ -18,7 +18,7 @@ class StandardDiffusionLoss(nn.Module):
         loss_type: str = "l2",
         offset_noise_level: float = 0.0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
-        use_face_perceptual: bool = False,
+        use_face_perceptual: bool = False, # ! - computationally intractable, legacy
         face_perceptual_weight: float = 0.3,
         face_crop_size: int = 128,
     ):
@@ -161,53 +161,61 @@ class StandardDiffusionLoss(nn.Module):
                 "first_stage_model and scale_factor must be set before using face perceptual loss."
             )
 
-        B, T, C, H, W = model_output.shape
-        
-        # Unscale the predicted latents before decoding (taken care of by first_stage_model)
-        # model_output_unscaled = model_output / self.scale_factor
-        
-        # Reshape for decoding: [B*T, C, H, W]
-        # Gradients need to flow through the predicted RGBs
-        pred_rgbs_flat = self.first_stage_model.decode(model_output.reshape(B * T, C, H, W))
-        gt_rgbs_flat = batch["frames"].reshape(B * T, 3, pred_rgbs_flat.shape[2], pred_rgbs_flat.shape[3])
+        B, T, C, H, W = model_output.shape # H, W are latent dim 72x72 spatial dims
+
+        # cropped model output (assuming that face output is in the same position)
+        face_bboxes_flat = batch["face_bbox"].reshape(B * T, 4)
+        model_output = model_output.reshape(B * T, C, H, W)
+        rgb_gt = batch["frames"].reshape(B * T, 3, H * 8, W * 8) # these are 576^2
         
         # Get face bounding boxes and flatten them
-        face_bboxes_flat = batch["face_bbox"].reshape(B * T, 4)
-
-        cropped_pred_rgbs = []
+        cropped_pred_latents = []
         cropped_gt_rgbs = []
 
         # 2. Loop through the batch to CROP the RGB images
         for i in range(B * T):
             x1, y1, x2, y2 = face_bboxes_flat[i].long()
             
-            # Skip invalid bboxes (-1 placeholder and others)
-            if x1 >= x2 or y1 >= y2 or x1 < 0:
+            if x1 < 0 or y1 < 0 or x2 >= x1 or y2 >= y1:
+                continue
+            
+            x1_lat, y1_lat = x1//8, y1//8
+            x2_lat, y2_lat = x2//8, y2//8
+
+            if x1_lat >=x2_lat or y1_lat >= y2_lat:
                 continue
                 
-            # Crop the face region directly from the full RGB images
-            pred_crop = pred_rgbs_flat[i:i+1, :, y1:y2, x1:x2]
-            gt_crop = gt_rgbs_flat[i:i+1, :, y1:y2, x1:x2]
+            # crop the "face region" @ the latent level
+            # latents are spatially aligned well enough for this to be valid
+            pred_crop = model_output[i:i+1, :, y1_lat:y2_lat, x1_lat:x2_lat]
+            gt_crop = rgb_gt[i:i+1, :, y1:y2, x1:x2] # this is in RGB space
             
-            cropped_pred_rgbs.append(pred_crop)
+            cropped_pred_latents.append(pred_crop)
             cropped_gt_rgbs.append(gt_crop)
 
         # If no valid faces were found in the batch, return zero loss
-        if not cropped_pred_rgbs:
+        if not cropped_pred_latents:
             return torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
 
-        # 3. Resize all collected RGB crops to a uniform size for LPIPS
+        # If faces are found, decode face cropped latents
+        decoded_crop_latents = []
+        for crop in cropped_pred_latents:
+            decoded_crop_latents.append(self.first_stage_model.decode(crop))
+
+        # 3. Resize decoded latents to a fixed size (in RGB space)
         resized_pred_crops = torch.cat([
             F.interpolate(crop, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
-            for crop in cropped_pred_rgbs
+            for crop in decoded_crop_latents
         ], dim=0)
         
+        # resize GT crops to the same size
         resized_gt_crops = torch.cat([
             F.interpolate(crop, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
             for crop in cropped_gt_rgbs
         ], dim=0)
 
         # 4. Compute LPIPS loss on the batched, resized RGB crops
+        # chunk_size = 4 -- use later if no space
         lpips_loss = self.lpips(resized_pred_crops, resized_gt_crops)
         return lpips_loss.mean()
 
