@@ -5,7 +5,7 @@ import inspect
 import os
 import sys
 from inspect import Parameter
-from typing import Union
+from typing import Union, Optional
 
 import numpy as np
 import pytorch_lightning as pl
@@ -27,6 +27,7 @@ from seva.sampling import MultiviewCFG
 from sgm.util import exists, instantiate_from_config, isheatmap
 import matplotlib.cm as cm
 from matplotlib.image import imread
+import torch.nn.functional as F
 
 import threading
 import queue
@@ -337,6 +338,8 @@ class LogTask:
     # pl_module: pl.LightningModule
     logger: WandbLogger
     scale_factor: float
+    face_bbox: Optional[torch.Tensor] = None
+
 
 class ImageLogger(Callback):
     def __init__(
@@ -467,13 +470,13 @@ class ImageLogger(Callback):
             # Perform the actual logging
             self.log_local(
                 task.save_dir, task.split, images, masks,
-                task.global_step, task.current_epoch, task.batch_idx, task.logger, task.scale_factor    
+                task.global_step, task.current_epoch, task.batch_idx, task.logger, task.scale_factor, task.face_bbox    
             )
             
         except Exception as e:
-            self.logger.error(f"[ImageLogger] Error processing log task: {e}")
+            self.logger.error(f"[ImageLogger] Error processing log task: {e}", exc_info=True)
 
-    def _queue_log_task(self, save_dir, split, images, masks, global_step, current_epoch, batch_idx, logger, scale_factor):
+    def _queue_log_task(self, save_dir, split, images, masks, global_step, current_epoch, batch_idx, logger, scale_factor, face_bbox=None):
         """Queue a logging task for background processing"""
         if self.shutdown_event.is_set():
             self.logger.info("[ImageLogger] Logger is shutting down, skipping log task")
@@ -489,7 +492,8 @@ class ImageLogger(Callback):
             batch_idx=batch_idx,
             # pl_module=pl_module,
             logger=logger,
-            scale_factor=scale_factor
+            scale_factor=scale_factor,
+            face_bbox=face_bbox
         )
         
         try:
@@ -647,6 +651,7 @@ class ImageLogger(Callback):
         batch_idx,
         logger,
         scale_factor,
+        face_bbox=None
         # pl_module: Union[None, pl.LightningModule] = None,
     ):
         root = os.path.join(save_dir, "images", split)
@@ -735,6 +740,64 @@ class ImageLogger(Callback):
                     images=[diffmap_img],
                     step=global_step,
                 )
+        
+        if face_bbox is not None and "samples" in images and "reconstructions" in images:
+            face_crops_gt = []
+            face_crops_recon = []
+            face_crops_samples = []
+
+            num_images_to_log = images["inputs"].shape[0]
+
+            for i in range(num_images_to_log):
+                x1, y1, x2, y2 = face_bbox[i].long()
+                
+                # Skip invalid bboxes
+                if x1 < 0 or y1 < 0 or x1 >= x2 or y1 >= y2:
+                    continue
+
+                # Crop from each source
+                # Images are already decoded to RGB and are in range [-1, 1]
+                crop_gt = images["inputs"][i:i+1, :, y1:y2, x1:x2]
+                crop_recon = images["reconstructions"][i:i+1, :, y1:y2, x1:x2]
+                crop_sample = images["samples"][i:i+1, :, y1:y2, x1:x2]
+
+                # Resize to a standard size for visualization
+                target_size = (128, 128)
+
+                face_crops_gt.append(F.interpolate(crop_gt, size=target_size, mode='bilinear', align_corners=False))
+                face_crops_recon.append(F.interpolate(crop_recon, size=target_size, mode='bilinear', align_corners=False))
+                face_crops_samples.append(F.interpolate(crop_sample, size=target_size, mode='bilinear', align_corners=False))
+            
+            if face_crops_gt:
+                # Interleave the crops: [gt1, recon1, sample1, gt2, recon2, sample2, ...]
+                interleaved_crops = []
+                for gt, recon, sample in zip(face_crops_gt, face_crops_recon, face_crops_samples):
+                    interleaved_crops.extend([gt, recon, sample])
+                
+                # Create a grid
+                grid = torchvision.utils.make_grid(torch.cat(interleaved_crops, dim=0), nrow=3) # 3 columns: GT, Recon, Sample
+                
+                # Convert to savable format
+                grid = (grid + 1.0) / 2.0  # from [-1, 1] to [0, 1]
+                grid = grid.permute(1, 2, 0).to("cpu").numpy()
+                grid = (grid * 255).astype(np.uint8)
+
+
+                # Save the grid
+                filename = f"face_crops_gs-{global_step:06}_e-{current_epoch:06}_b-{batch_idx:06}.png"
+                path = os.path.join(root, filename)
+                self.logger.info(f"ImageLogger::Saving face crops to: {path}")
+                img = Image.fromarray(grid)
+                img.save(path)
+
+                # Log to wandb
+                if isinstance(logger, WandbLogger):
+                    logger.log_image(
+                        key=f"{split}/face_crops",
+                        images=[img],
+                        step=global_step,
+                    )
+
 
     @rank_zero_only
     def log_img(self, pl_module, batch, batch_idx, split="train", sample=True): #pl_module: DiffusionEngine
@@ -866,6 +929,10 @@ class ImageLogger(Callback):
                 if sample:
                     pre_images["samples"] = samples
 
+                face_bbox = batch.get("face_bbox")
+                if face_bbox is not None:
+                    face_bbox = face_bbox.reshape(-1, 4)[:N].detach().cpu()
+
                 # flatten for decoder
                 for k in pre_images: # images is dict{inputs, reconstructions, samples} (as in diffusion.py)
                     if isinstance(pre_images[k], torch.Tensor):
@@ -918,7 +985,8 @@ class ImageLogger(Callback):
                 # add this iteration's images to the CPU-based logger queue
                 self._queue_log_task(
                     save_dir, split, pre_images, masks,
-                    pl_module.global_step, pl_module.current_epoch, batch_idx, pl_module.logger, pl_module.scale_factor
+                    pl_module.global_step, pl_module.current_epoch, batch_idx, pl_module.logger, pl_module.scale_factor,
+                    face_bbox=face_bbox
                 )
             
 
@@ -980,6 +1048,7 @@ class ImageLogger(Callback):
             torch.distributed.barrier() # all ranks enter barrier when logging
 
             if trainer.is_global_zero:
+                print(f"[ImageLogger] Logging images for train batch {batch_idx}")
                 self.log_img(pl_module, batch, batch_idx, split="train")
 
             torch.distributed.barrier() # all wait for rank 0, then continue
