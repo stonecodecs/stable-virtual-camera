@@ -140,7 +140,7 @@ data:
   target: seva.data.mvh_dataloader.MVHumanNetLoader
   params:
     root_dir: /workspace/datasetvol/mvhuman_data/mv_captures
-    batch_size: 1
+    batch_size: 6
     num_workers: 2
     num_images: 8
     step_size: 60

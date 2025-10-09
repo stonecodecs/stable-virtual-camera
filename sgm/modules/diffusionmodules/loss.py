@@ -8,7 +8,45 @@ from ...modules.autoencoding.lpips.loss.lpips import LPIPS
 from ...modules.encoders.modules import GeneralConditioner
 from ...util import append_dims, instantiate_from_config
 from .denoiser import Denoiser
+ 
 
+def pad_to(latent, target_size, relative=False):
+    """
+    Center pads the latent to a target size.
+    If relative, then we pad relative to the CURRENT size of 'latent'.
+    Relative padding makes target_size 4D tensor for the padding values
+    (from 2nd return value of this function!)
+    (NOTE: if RGB image is 'latent' this will be used to pad the RGB image correspondingly.)
+    """
+    # latent is [B, C, H, W]
+    B, C, H, W = latent.shape
+
+    if isinstance(target_size, int):
+        target_size = (target_size, target_size)
+        
+    H_target, W_target = target_size
+
+    if H == H_target and W == W_target:
+        return latent, (0, 0, 0, 0)
+
+    if relative:
+        # then padding is actually 4D!
+        return torch.nn.functional.pad(latent, target_size) \
+               , (0, 0, 0, 0) # save padding values
+    
+    # Calculate padding for height
+    pad_h_total = max(0, H_target - H)
+    pad_top = pad_h_total // 2
+    pad_bottom = pad_h_total - pad_top
+    
+    # Calculate padding for width
+    pad_w_total = max(0, W_target - W)
+    pad_left = pad_w_total // 2
+    pad_right = pad_w_total - pad_left
+    
+    # The padding format is (pad_left, pad_right, pad_top, pad_bottom)
+    return torch.nn.functional.pad(latent, (pad_left, pad_right, pad_top, pad_bottom)) \
+           , (pad_left, pad_right, pad_top, pad_bottom) # save padding values
 
 class StandardDiffusionLoss(nn.Module):
     def __init__(
@@ -176,7 +214,7 @@ class StandardDiffusionLoss(nn.Module):
         for i in range(B * T):
             x1, y1, x2, y2 = face_bboxes_flat[i].long()
             
-            if x1 < 0 or y1 < 0 or x2 >= x1 or y2 >= y1:
+            if x1 < 0 or y1 < 0 or x1 >= x2 or y1 >= y2:
                 continue
             
             x1_lat, y1_lat = x1//8, y1//8
@@ -197,21 +235,42 @@ class StandardDiffusionLoss(nn.Module):
         if not cropped_pred_latents:
             return torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
 
-        # If faces are found, decode face cropped latents
+        # get maximum spatial size of crops
+        # will be used for stacking and corresponding RGB GT padding
+        # to align with the padded latent stack
+        # Why? -> takes around 20s/iter based on the list approach.
+        # This takes [TBD].
+        max_W = max(crop.shape[-1] for crop in cropped_pred_latents)
+        max_H = max(crop.shape[-2] for crop in cropped_pred_latents)
+
+        # If faces are found, pad latents to uniform size
         decoded_crop_latents = []
+        rel_padding = []
         for crop in cropped_pred_latents:
-            decoded_crop_latents.append(self.first_stage_model.decode(crop))
+            padded_crop, rel_pad = pad_to(crop, (max_H, max_W), relative=False)
+            decoded_crop_latents.append(padded_crop)
+            rel_padding.append(rel_pad)
+
+        # stack and decode
+        decoded_crop_latents = self.first_stage_model.decode(torch.cat(decoded_crop_latents, dim=0))
+
+        # pad the RGB GTs accordingly with zero-pad
+        # to "align" with the padded decoded latents
+        padded_gt_rgbs = []
+        for crop, rel_pad in zip(cropped_gt_rgbs, rel_padding):
+            padded_crop, rel_pad = pad_to(crop, (rel_pad), relative=True)
+            padded_gt_rgbs.append(padded_crop)
+
+        padded_gt_rgbs = torch.cat(padded_gt_rgbs, dim=0)
 
         # 3. Resize decoded latents to a fixed size (in RGB space)
         resized_pred_crops = torch.cat([
-            F.interpolate(crop, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
-            for crop in decoded_crop_latents
+            F.interpolate(decoded_crop_latents, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
         ], dim=0)
         
         # resize GT crops to the same size
         resized_gt_crops = torch.cat([
-            F.interpolate(crop, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
-            for crop in cropped_gt_rgbs
+            F.interpolate(padded_gt_rgbs, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
         ], dim=0)
 
         # 4. Compute LPIPS loss on the batched, resized RGB crops
