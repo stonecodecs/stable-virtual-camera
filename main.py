@@ -625,14 +625,14 @@ class ImageLogger(Callback):
     @torch.no_grad()
     def denormalize_image(self, tensor):
         # Denormalize and convert to PIL image
-        tensor = tensor.cpu().squeeze(0)
+        tensor = (tensor + 1.0) / 2.0
+        tensor = torch.clamp(tensor, 0, 1)
         return tensor
 
     @torch.no_grad()
     def tensor_to_image(self, tensor):
         # Denormalize and convert to PIL image
         tensor = tensor.cpu().squeeze(0)
-        tensor = self.denormalize_image(tensor)
         return tensor
 
     @torch.no_grad()
@@ -781,7 +781,7 @@ class ImageLogger(Callback):
                     interleaved_crops.extend([recon, sample])
                 
                 # Create a grid
-                grid = torchvision.utils.make_grid(torch.cat(interleaved_crops, dim=0), nrow=3) # 3 columns: GT, Recon, Sample
+                grid = torchvision.utils.make_grid(torch.cat(interleaved_crops, dim=0), nrow=2) # 2 columns: Recon, Sample
                 
                 # Convert to savable format
                 grid = (grid + 1.0) / 2.0  # from [-1, 1] to [0, 1]
