@@ -59,6 +59,7 @@ class StandardDiffusionLoss(nn.Module):
         use_face_perceptual: bool = False, # ! - computationally intractable, legacy
         face_perceptual_weight: float = 0.3,
         face_crop_size: int = 128,
+        face_weighting: float = 0.0,
     ):
         super().__init__()
 
@@ -72,6 +73,11 @@ class StandardDiffusionLoss(nn.Module):
         self.use_face_perceptual = use_face_perceptual
         self.face_perceptual_weight = face_perceptual_weight
         self.face_crop_size = face_crop_size
+        self.face_weighting = face_weighting # how much to weigh the face over the rest
+        # 0.0 -> no extra face weighting, spatially uniform loss weighting
+        # NOTE: this is different from using face_perceptual_weight
+        # as this creates a "weighting mask" in the latent space
+        # and applies to regular L2 loss.
         
         # Store reference to first_stage_model for RGB decoding (set externally)
         self.first_stage_model = None
@@ -151,8 +157,9 @@ class StandardDiffusionLoss(nn.Module):
         else:
             w = append_dims(self.loss_weighting(sigmas), input.ndim)
         
+        print("batch['face_bbox']: ", batch["face_bbox"])
         # Compute base loss
-        base_loss = self.get_loss(model_output, input, w)
+        base_loss = self.get_loss(model_output, input, w, face_bbox=batch["face_bbox"], enable_face_weighting=self.face_weighting > 0.0)
         
         # Add face perceptual loss if enabled
         if self.use_face_perceptual and "face_bbox" in batch:
@@ -169,17 +176,41 @@ class StandardDiffusionLoss(nn.Module):
         
         return base_loss
 
-    def get_loss(self, model_output, target, w):
+    def get_face_weighting_loss(self, face_bbox, spatial_loss):
+        spatial_mask = torch.zeros_like(spatial_loss, dtype=torch.bool)
+        valid_face_mask = (face_bbox >= 0).any(dim=-1)
+        x1, y1, x2, y2 = face_bbox[valid_face_mask].long().T # [B, num_faces in T, 4]
+        spatial_mask[valid_face_mask][x1:x2, y1:y2] = 1.0 # face regions = 1.0
+        return torch.mean(spatial_loss[spatial_mask], dim=-1)
+
+
+    def get_loss(self, model_output, target, w, face_bbox=None, enable_face_weighting=False):
+        # add face weighting if face_weighting > 0.0
+        additional_loss = torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
+ 
         if self.loss_type == "l2":
-            return torch.mean(
-                (w * (model_output - target) ** 2).reshape(target.shape[0], -1), 1
+            spatial_loss = w * (model_output - target) ** 2 # [B, T, C, H, W]
+            loss = torch.mean(
+                spatial_loss.reshape(target.shape[0], -1), 1
             )
+            if enable_face_weighting and face_bbox is not None:
+                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss)
+                loss = loss + additional_loss
+            return loss
         elif self.loss_type == "l1":
-            return torch.mean(
-                (w * (model_output - target).abs()).reshape(target.shape[0], -1), 1
+            spatial_loss = w * (model_output - target).abs()
+            loss = torch.mean(
+                spatial_loss.reshape(target.shape[0], -1), 1
             )
+            if enable_face_weighting and face_bbox is not None:
+                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss)
+                loss = loss + additional_loss
+            return loss
         elif self.loss_type == "lpips":
             loss = self.lpips(model_output, target).reshape(-1)
+            if enable_face_weighting and face_bbox is not None:
+                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, loss)
+                loss = loss + additional_loss
             return loss
         else:
             raise NotImplementedError(f"Unknown loss type {self.loss_type}")

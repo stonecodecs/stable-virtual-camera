@@ -126,6 +126,7 @@ model:
               target: sgm.modules.diffusionmodules.discretizer.SevaDDPMDiscretization
         use_face_perceptual: true
         face_perceptual_weight: 1.0
+        face_weighting: 3.0
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler
       params:
@@ -140,7 +141,7 @@ data:
   target: seva.data.mvh_dataloader.MVHumanNetLoader
   params:
     root_dir: /workspace/datasetvol/mvhuman_data/mv_captures
-    batch_size: 6
+    batch_size: 1
     num_workers: 4
     num_images: 8
     step_size: 60

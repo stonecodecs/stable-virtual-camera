@@ -621,13 +621,18 @@ class ImageLogger(Callback):
         del border_tensor
         return bordered_image
 
+
+    @torch.no_grad()
+    def denormalize_image(self, tensor):
+        # Denormalize and convert to PIL image
+        tensor = tensor.cpu().squeeze(0)
+        return tensor
+
     @torch.no_grad()
     def tensor_to_image(self, tensor):
         # Denormalize and convert to PIL image
         tensor = tensor.cpu().squeeze(0)
-        tensor = tensor * 0.5 + 0.5  # Denormalize
-        # tensor = torch.clamp(tensor, 0, 1)
-        tensor = torch.clamp(tensor, 0, 1)
+        tensor = self.denormalize_image(tensor)
         return tensor
 
     @torch.no_grad()
@@ -679,6 +684,7 @@ class ImageLogger(Callback):
             else:            
                 # SEVA multi-view tensors are already flattened in log_img to [N, C, H, W]
                 # Add colored borders based on image type
+                # for all (input, decoded clean_latent, samples):
                 bordered_images = []
                 for i, img in enumerate(images[k]):
                     # Determine border color based on image key or index
@@ -691,7 +697,7 @@ class ImageLogger(Callback):
                     if ref_mask[i]:
                         border_color = (0.0, 255.0, 0.0) # green
 
-                    img = self.tensor_to_image(img) # (-1, 1) ->(0, 1)
+                    img = self.denormalize_image(self.tensor_to_image(img)) # (-1, 1) ->(0, 1)
                     bordered_img = self.add_colored_border(img, border_color, border_width=24)
                     bordered_images.append(bordered_img)
                 
@@ -724,6 +730,8 @@ class ImageLogger(Callback):
                         images=[img],
                         step=global_step,
                     )
+        
+        # log diffmap (HACK - just take the diffmap of the post-processed grid)
         if len(components_for_diffmap) == 2:
             diffmap = self.diffmap(components_for_diffmap[0], components_for_diffmap[1])
             filename = "{}_gs-{:06}_e-{:06}_b-{:06}.png".format(
@@ -741,12 +749,13 @@ class ImageLogger(Callback):
                     step=global_step,
                 )
         
+        # log face crops
         if face_bbox is not None and "samples" in images and "reconstructions" in images:
             face_crops_gt = []
             face_crops_recon = []
             face_crops_samples = []
 
-            num_images_to_log = images["inputs"].shape[0]
+            num_images_to_log = face_bbox.shape[0]
 
             for i in range(num_images_to_log):
                 x1, y1, x2, y2 = face_bbox[i].long()
