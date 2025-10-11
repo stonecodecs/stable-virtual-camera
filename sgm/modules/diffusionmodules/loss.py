@@ -156,8 +156,6 @@ class StandardDiffusionLoss(nn.Module):
             w = append_dims(self.loss_weighting(sigmas, cond["mask"], batch["ref_mask"]), input.ndim) # replace with ref_mask
         else:
             w = append_dims(self.loss_weighting(sigmas), input.ndim)
-        
-        print("batch['face_bbox']: ", batch["face_bbox"])
         # Compute base loss
         base_loss = self.get_loss(model_output, input, w, face_bbox=batch["face_bbox"], enable_face_weighting=self.face_weighting > 0.0)
         
@@ -177,11 +175,50 @@ class StandardDiffusionLoss(nn.Module):
         return base_loss
 
     def get_face_weighting_loss(self, face_bbox, spatial_loss):
+        """
+        Compute weighted loss that emphasizes face regions.
+        
+        Args:
+            face_bbox: [B, T, 4] in pixel coords (x1, y1, x2, y2)
+            spatial_loss: [B, T, C, H, W] spatial loss map
+            
+        Returns:
+            Face-weighted loss scalar
+        """
+        B, T, C, H, W = spatial_loss.shape
+        
+        # Create spatial mask for face regions
         spatial_mask = torch.zeros_like(spatial_loss, dtype=torch.bool)
-        valid_face_mask = (face_bbox >= 0).any(dim=-1)
-        x1, y1, x2, y2 = face_bbox[valid_face_mask].long().T # [B, num_faces in T, 4]
-        spatial_mask[valid_face_mask][x1:x2, y1:y2] = 1.0 # face regions = 1.0
-        return torch.mean(spatial_loss[spatial_mask], dim=-1)
+        
+        # Loop through batch and time to mark face regions
+        for b in range(B):
+            for t in range(T):
+                x1, y1, x2, y2 = face_bbox[b, t].long()
+                
+                # Skip invalid bboxes
+                if x1 < 0 or y1 < 0 or x1 >= x2 or y1 >= y2:
+                    continue
+                
+                # Convert pixel coords to latent coords (8x downsampling)
+                x1_lat = (x1 // 8).clamp(0, W - 1)
+                y1_lat = (y1 // 8).clamp(0, H - 1)
+                x2_lat = (x2 // 8).clamp(1, W)
+                y2_lat = (y2 // 8).clamp(1, H)
+                
+                if x1_lat >= x2_lat or y1_lat >= y2_lat:
+                    continue
+                
+                # Mark face region in mask
+                spatial_mask[b, t, :, y1_lat:y2_lat, x1_lat:x2_lat] = True
+        
+        # If no valid faces, return zero
+        if not spatial_mask.any():
+            return torch.tensor(0.0, device=spatial_loss.device, dtype=spatial_loss.dtype)
+        
+        # Average loss over face regions only, loss per batch
+        face_loss = torch.mean(spatial_loss[spatial_mask].reshape(B, -1), dim=-1)
+        
+        return face_loss
 
 
     def get_loss(self, model_output, target, w, face_bbox=None, enable_face_weighting=False):
