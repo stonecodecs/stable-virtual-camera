@@ -751,7 +751,6 @@ class ImageLogger(Callback):
         
         # log face crops
         if face_bbox is not None and "samples" in images and "reconstructions" in images:
-            face_crops_gt = []
             face_crops_recon = []
             face_crops_samples = []
 
@@ -766,22 +765,20 @@ class ImageLogger(Callback):
 
                 # Crop from each source
                 # Images are already decoded to RGB and are in range [-1, 1]
-                crop_gt = images["inputs"][i:i+1, :, y1:y2, x1:x2]
                 crop_recon = images["reconstructions"][i:i+1, :, y1:y2, x1:x2]
                 crop_sample = images["samples"][i:i+1, :, y1:y2, x1:x2]
 
                 # Resize to a standard size for visualization
                 target_size = (128, 128)
 
-                face_crops_gt.append(F.interpolate(crop_gt, size=target_size, mode='bilinear', align_corners=False))
                 face_crops_recon.append(F.interpolate(crop_recon, size=target_size, mode='bilinear', align_corners=False))
                 face_crops_samples.append(F.interpolate(crop_sample, size=target_size, mode='bilinear', align_corners=False))
             
-            if face_crops_gt:
-                # Interleave the crops: [gt1, recon1, sample1, gt2, recon2, sample2, ...]
+            if face_crops_recon:
+                # Interleave the crops: [recon1, sample1, recon2, sample2, ...]
                 interleaved_crops = []
-                for gt, recon, sample in zip(face_crops_gt, face_crops_recon, face_crops_samples):
-                    interleaved_crops.extend([gt, recon, sample])
+                for recon, sample in zip(face_crops_recon, face_crops_samples):
+                    interleaved_crops.extend([recon, sample])
                 
                 # Create a grid
                 grid = torchvision.utils.make_grid(torch.cat(interleaved_crops, dim=0), nrow=3) # 3 columns: GT, Recon, Sample

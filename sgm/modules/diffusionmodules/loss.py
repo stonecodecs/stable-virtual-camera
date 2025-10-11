@@ -183,7 +183,7 @@ class StandardDiffusionLoss(nn.Module):
             spatial_loss: [B, T, C, H, W] spatial loss map
             
         Returns:
-            Face-weighted loss scalar
+            Face-weighted loss scalar per batch element [B]
         """
         B, T, C, H, W = spatial_loss.shape
         
@@ -211,12 +211,16 @@ class StandardDiffusionLoss(nn.Module):
                 # Mark face region in mask
                 spatial_mask[b, t, :, y1_lat:y2_lat, x1_lat:x2_lat] = True
         
-        # If no valid faces, return zero
+        # If no valid faces, return zero for all batch elements
         if not spatial_mask.any():
-            return torch.tensor(0.0, device=spatial_loss.device, dtype=spatial_loss.dtype)
+            return torch.zeros(B, device=spatial_loss.device, dtype=spatial_loss.dtype)
         
-        # Average loss over face regions only, loss per batch
-        face_loss = torch.mean(spatial_loss[spatial_mask].reshape(B, -1), dim=-1)
+        # Compute face loss per batch element separately
+        face_loss = torch.zeros(B, device=spatial_loss.device, dtype=spatial_loss.dtype)
+        for b in range(B):
+            batch_mask = spatial_mask[b]
+            if batch_mask.any():
+                face_loss[b] = torch.mean(spatial_loss[b][batch_mask])
         
         return face_loss
 
