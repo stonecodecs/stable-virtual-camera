@@ -570,18 +570,19 @@ class MVHumanNetDataset(Dataset):
             ref_mask[fix_frame_idx] = True # this becomes the fixed frame
             # input_frames_mask = ref_mask.clone()
 
-        if self.use_inconsistent:
+        if self.use_inconsistent and self.iclight_dataset_path is not None:
             # get ic-light paths (corresponding to selected frame!)
             ic_paths = [path.replace("mv_captures", "relit_images").replace(".jpg", ".png") for path in sampled_image_paths]
 
             # get infu paths (randomly sampled!)
-            infu_num_images_in_directory = len(os.listdir(self.infu_dataset_path + f"/{subject_id}"))
-            infu_random_indices = np.random.choice(infu_num_images_in_directory, self.num_images, replace=False) + 1
-            infu_paths = [self._get_infu_path(subject_id, f"{infu_random_indices[i]:06d}") for i in range(self.num_images)]
-
-            # use a "mask" to determine which of the ic paths are from ic-light and which are from infu
-            ic_mask = torch.rand(self.num_images) <= self.ic_sampling_prob
-            ic_paths = [ic_paths[i] if ic_mask[i] else infu_paths[i] for i in range(self.num_images)]
+            if self.infu_dataset_path is not None and self.ic_sampling_prob > 0:
+                infu_num_images_in_directory = len(os.listdir(self.infu_dataset_path + f"/{subject_id}"))
+                infu_random_indices = np.random.choice(infu_num_images_in_directory, self.num_images, replace=False) + 1
+                infu_paths = [self._get_infu_path(subject_id, f"{infu_random_indices[i]:06d}") for i in range(self.num_images)]
+ 
+                # use a "mask" to determine which of the ic paths are from ic-light and which are from infu
+                ic_mask = torch.rand(self.num_images) <= self.ic_sampling_prob
+                ic_paths = [ic_paths[i] if ic_mask[i] else infu_paths[i] for i in range(self.num_images)]
 
             ic_rgb = []
             tensorize = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
