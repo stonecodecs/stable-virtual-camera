@@ -157,7 +157,7 @@ class StandardDiffusionLoss(nn.Module):
         else:
             w = append_dims(self.loss_weighting(sigmas), input.ndim)
         # Compute base loss
-        base_loss = self.get_loss(model_output, input, w, face_bbox=batch["face_bbox"], enable_face_weighting=self.face_weighting > 0.0)
+        base_loss = self.get_loss(model_output, input, w, face_bbox=batch.get("face_bbox"), ref_mask=batch.get("ref_mask"), enable_face_weighting=self.face_weighting > 0.0)
         
         # Add face perceptual loss if enabled
         if self.use_face_perceptual and "face_bbox" in batch:
@@ -174,13 +174,14 @@ class StandardDiffusionLoss(nn.Module):
         
         return base_loss
 
-    def get_face_weighting_loss(self, face_bbox, spatial_loss):
+    def get_face_weighting_loss(self, face_bbox, spatial_loss, ref_mask):
         """
         Compute weighted loss that emphasizes face regions.
         
         Args:
             face_bbox: [B, T, 4] in pixel coords (x1, y1, x2, y2)
             spatial_loss: [B, T, C, H, W] spatial loss map
+            ref_mask: [B, T] boolean tensor indicating reference frames (should be excluded)
             
         Returns:
             Face-weighted loss scalar per batch element [B]
@@ -193,6 +194,10 @@ class StandardDiffusionLoss(nn.Module):
         # Loop through batch and time to mark face regions
         for b in range(B):
             for t in range(T):
+                # Skip reference frames (ground truth)
+                if ref_mask[b, t]:
+                    continue
+                    
                 x1, y1, x2, y2 = face_bbox[b, t].long()
                 
                 # Skip invalid bboxes
@@ -225,7 +230,7 @@ class StandardDiffusionLoss(nn.Module):
         return face_loss
 
 
-    def get_loss(self, model_output, target, w, face_bbox=None, enable_face_weighting=False):
+    def get_loss(self, model_output, target, w, face_bbox=None, ref_mask=None, enable_face_weighting=False):
         # add face weighting if face_weighting > 0.0
         additional_loss = torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
  
@@ -234,8 +239,8 @@ class StandardDiffusionLoss(nn.Module):
             loss = torch.mean(
                 spatial_loss.reshape(target.shape[0], -1), 1
             )
-            if enable_face_weighting and face_bbox is not None:
-                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss)
+            if enable_face_weighting and face_bbox is not None and ref_mask is not None:
+                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss, ref_mask)
                 loss = loss + additional_loss
             return loss
         elif self.loss_type == "l1":
@@ -243,14 +248,14 @@ class StandardDiffusionLoss(nn.Module):
             loss = torch.mean(
                 spatial_loss.reshape(target.shape[0], -1), 1
             )
-            if enable_face_weighting and face_bbox is not None:
-                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss)
+            if enable_face_weighting and face_bbox is not None and ref_mask is not None:
+                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss, ref_mask)
                 loss = loss + additional_loss
             return loss
         elif self.loss_type == "lpips":
             loss = self.lpips(model_output, target).reshape(-1)
-            if enable_face_weighting and face_bbox is not None:
-                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, loss)
+            if enable_face_weighting and face_bbox is not None and ref_mask is not None:
+                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, loss, ref_mask)
                 loss = loss + additional_loss
             return loss
         else:
@@ -264,6 +269,7 @@ class StandardDiffusionLoss(nn.Module):
     ) -> torch.Tensor:
         """
         Compute perceptual loss on face-cropped regions in RGB space.
+        Only processes non-reference frames (where ref_mask is False).
         1. Decodes full latents to full RGB images.
         2. Crops face regions from the decoded RGB images and ground-truth frames.
         3. Resizes all crops to a uniform size.
@@ -279,6 +285,7 @@ class StandardDiffusionLoss(nn.Module):
 
         # cropped model output (assuming that face output is in the same position)
         face_bboxes_flat = batch["face_bbox"].reshape(B * T, 4)
+        ref_mask_flat = batch["ref_mask"].reshape(B * T)  # Flatten ref_mask to match
         model_output = model_output.reshape(B * T, C, H, W)
         rgb_gt = batch["frames"].reshape(B * T, 3, H * 8, W * 8) # these are 576^2
         
@@ -286,8 +293,12 @@ class StandardDiffusionLoss(nn.Module):
         cropped_pred_latents = []
         cropped_gt_rgbs = []
 
-        # 2. Loop through the batch to CROP the RGB images
+        # 2. Loop through the batch to CROP the RGB images (skip reference frames)
         for i in range(B * T):
+            # Skip reference frames (ground truth)
+            if ref_mask_flat[i]:
+                continue
+                
             x1, y1, x2, y2 = face_bboxes_flat[i].long()
             
             if x1 < 0 or y1 < 0 or x1 >= x2 or y1 >= y2:

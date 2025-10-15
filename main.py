@@ -749,7 +749,7 @@ class ImageLogger(Callback):
                     step=global_step,
                 )
         
-        # log face crops
+        # log face crops (only for non-reference frames)
         if face_bbox is not None and "samples" in images and "reconstructions" in images:
             face_crops_recon = []
             face_crops_samples = []
@@ -757,6 +757,10 @@ class ImageLogger(Callback):
             num_images_to_log = face_bbox.shape[0]
 
             for i in range(num_images_to_log):
+                # Skip reference frames (ground truth) since they're not samples from the model
+                if ref_mask[i]:
+                    continue
+                    
                 x1, y1, x2, y2 = face_bbox[i].long()
                 
                 # Skip invalid bboxes
@@ -787,7 +791,6 @@ class ImageLogger(Callback):
                 grid = (grid + 1.0) / 2.0  # from [-1, 1] to [0, 1]
                 grid = grid.permute(1, 2, 0).to("cpu").numpy()
                 grid = (grid * 255).astype(np.uint8)
-
 
                 # Save the grid
                 filename = f"face_crops_gs-{global_step:06}_e-{current_epoch:06}_b-{batch_idx:06}.png"
