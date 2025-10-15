@@ -1256,6 +1256,12 @@ if __name__ == "__main__":
     cfgdir = os.path.join(logdir, "configs")
     seed_everything(opt.seed, workers=True)
 
+    # Set NCCL timeout to avoid timeouts on slower GPUs (e.g., A6000)
+    # Default is 1800 seconds (30 minutes), increase to 2 hours for safety
+    os.environ.setdefault('NCCL_TIMEOUT', '7200')  # 2 hours in seconds
+    os.environ.setdefault('NCCL_BLOCKING_WAIT', '1')  # Enable blocking wait for better error messages
+    print(f"NCCL timeout set to {os.environ['NCCL_TIMEOUT']} seconds")
+    
     # move before model init, in case a torch.compile(...) is called somewhere
     if opt.enable_tf32:
         # pt_version = version.parse(torch.__version__)
@@ -1383,6 +1389,7 @@ if __name__ == "__main__":
 
         # https://pytorch-lightning.readthedocs.io/en/stable/extensions/strategy.html
         # default to ddp if not further specified
+        from datetime import timedelta
         default_strategy_config = {"target": "pytorch_lightning.strategies.DDPStrategy"}
 
         if "strategy" in lightning_config:
@@ -1391,14 +1398,30 @@ if __name__ == "__main__":
             strategy_cfg = OmegaConf.create()
             default_strategy_config["params"] = {
                 "find_unused_parameters": False,
+                "timeout": 7200,  # 2 hours timeout in seconds (will be converted to timedelta)
                 # "static_graph": True,
                 # "ddp_comm_hook": default.fp16_compress_hook  # TODO: experiment with this, also for DDPSharded
             }
         strategy_cfg = OmegaConf.merge(default_strategy_config, strategy_cfg)
+        
+        # Extract and convert timeout from seconds to timedelta, then remove from config
+        timeout_seconds = None
+        if "params" in strategy_cfg and "timeout" in strategy_cfg.params:
+            timeout_seconds = strategy_cfg.params.timeout
+            # Remove timeout from config since OmegaConf can't handle timedelta objects
+            del strategy_cfg.params["timeout"]
+            print(f"Setting DDPStrategy timeout to {timeout_seconds} seconds ({timeout_seconds/3600:.1f} hours)")
+        
         print(
             f"strategy config: \n ++++++++++++++ \n {strategy_cfg} \n ++++++++++++++ "
         )
-        trainer_kwargs["strategy"] = instantiate_from_config(strategy_cfg)
+        
+        # Instantiate strategy and manually set timeout if needed
+        strategy = instantiate_from_config(strategy_cfg)
+        if timeout_seconds is not None:
+            strategy._timeout = timedelta(seconds=timeout_seconds)
+        
+        trainer_kwargs["strategy"] = strategy
 
         # add callback which sets up log directory
         default_callbacks_cfg = {

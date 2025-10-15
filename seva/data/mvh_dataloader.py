@@ -322,13 +322,18 @@ class MVHumanNetDataset(Dataset):
                         # annots_path = os.path.join(subject_path, "annots", camera, f"{time_id}_img.json")
                         bbox = annots['bbox'][camera][time_id]
                         if self.face_bboxes is not None:
-                            face_bbox_dict = self.face_bboxes[subject][camera][f"{time_id}_img.jpg"] # ['bbox_face']
-                            if face_bbox_dict == {}:
-                                face_bbox = [-1, -1, -1, -1] # indicates no face detected
-                            else:
-                                face_bbox = [face_bbox_dict['x1'], face_bbox_dict['y1'], face_bbox_dict['x2'], face_bbox_dict['y2']]
+                            # Handle missing face bbox data gracefully
+                            try:
+                                face_bbox_dict = self.face_bboxes[subject][camera][f"{time_id}_img.jpg"]
+                                if face_bbox_dict == {}:
+                                    face_bbox = [-1, -1, -1, -1] # indicates no face detected
+                                else:
+                                    face_bbox = [face_bbox_dict['x1'], face_bbox_dict['y1'], face_bbox_dict['x2'], face_bbox_dict['y2']]
+                            except KeyError:
+                                # Subject/camera/timestep not in face_bboxes - tag as no face
+                                face_bbox = [-1, -1, -1, -1]
 
-                            if face_bbox_dict != {} and ((bbox[2] - bbox[0]) == 0 or (bbox[3] - bbox[1]) == 0):
+                            if face_bbox != [-1, -1, -1, -1] and ((bbox[2] - bbox[0]) == 0 or (bbox[3] - bbox[1]) == 0):
                                 print(f"Skipping subject {subject} camera {camera} timestep {timestep} because bbox is invalid")
                                 continue
 
