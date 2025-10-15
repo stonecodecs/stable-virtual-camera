@@ -940,7 +940,7 @@ class ImageLogger(Callback):
 
                 face_bbox = batch.get("face_bbox")
                 if face_bbox is not None:
-                    face_bbox = face_bbox.reshape(-1, 4)[:N].detach().cpu()
+                    face_bbox = face_bbox[:N].reshape(-1, 4).detach().cpu()
 
                 # flatten for decoder
                 for k in pre_images: # images is dict{inputs, reconstructions, samples} (as in diffusion.py)
