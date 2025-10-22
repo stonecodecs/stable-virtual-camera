@@ -168,6 +168,15 @@ class MVHumanNetDataset(Dataset):
         self.infu_dataset_path = infu_dataset_path # InfU output directory
         self.face_bbox_dir = face_bbox_dir # Face bounding box directory
         # if not None, will use the "phase 2" expected training process
+        self.infu_num_images = {} # Dict[subject_id: int] number of images in infu directory
+        if self.infu_dataset_path is not None:
+            subjects_to_parse = os.listdir(self.infu_dataset_path)
+            for subject_id in subjects_to_parse:
+                if subject_id in self.exclude:
+                    continue
+                if self.only_include is not None and subject_id not in self.only_include:
+                    continue
+                self.infu_num_images[subject_id] = len(os.listdir(os.path.join(self.infu_dataset_path, subject_id)))
 
         if self.num_images > 16: # if more than 16, disable trajectory NVS batching
             self.adjacent_frame_sampling_prob = 0.0
@@ -581,7 +590,7 @@ class MVHumanNetDataset(Dataset):
 
             # get infu paths (randomly sampled!)
             if self.infu_dataset_path is not None and self.ic_sampling_prob > 0:
-                infu_num_images_in_directory = len(os.listdir(self.infu_dataset_path + f"/{subject_id}"))
+                infu_num_images_in_directory = self.infu_num_images[subject_id]
                 infu_random_indices = np.random.choice(infu_num_images_in_directory, self.num_images, replace=False) + 1
                 infu_paths = [self._get_infu_path(subject_id, f"{infu_random_indices[i]:06d}") for i in range(self.num_images)]
  
