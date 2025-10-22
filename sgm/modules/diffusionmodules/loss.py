@@ -319,8 +319,15 @@ class StandardDiffusionLoss(nn.Module):
             cropped_gt_rgbs.append(gt_crop)
 
         # If no valid faces were found in the batch, return zero loss
+        # NOTE: why not return 0 tensor?
+        # >> A: need dummy run to keep the comp. graph static and avoid deadlocks during multi-gpu training
+        # need to experiment more if this is "worth it" compared to overhead from dynamic comp. graph
         if not cropped_pred_latents:
-            return torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
+            dummy_latent = torch.zeros(1, C, 1, 1, device=model_output.device, dtype=model_output.dtype)
+            dummy_pred_rgb = self.first_stage_model.decode(dummy_latent)
+            dummy_gt_rgb = torch.zeros_like(dummy_pred_rgb)
+            dummy_loss = self.lpips(dummy_pred_rgb, dummy_gt_rgb)
+            return dummy_loss.mean() * 0.0
 
         # get maximum spatial size of crops
         # will be used for stacking and corresponding RGB GT padding
