@@ -133,7 +133,7 @@ class RandomBBoxCropper(object):
             # x2_new = (center_x + (crop_size // 2) + self.padding[2]).int()
             # y2_new = (center_y + (crop_size // 2) + self.padding[3]).int()
 
-            # calculate relative bbox
+            # calculate relative bbox -- only needed for inconsistent images!
             rel_bbox[:, 0] = x1_new - x1 # d_x1
             rel_bbox[:, 1] = y1_new - y1 # d_y1
             rel_bbox[:, 2] = x2_new - x2 # d_x2
@@ -205,6 +205,7 @@ class RandomBBoxCropper(object):
         images: torch.Tensor, 
         bbox: torch.Tensor, 
         K: torch.Tensor,
+        face_bboxes: torch.Tensor = None,
         **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -212,7 +213,8 @@ class RandomBBoxCropper(object):
             images: Tensor of shape (B, C, H, W)
             bbox: Tensor of shape (B, 4) with [x1, y1, x2, y2]
             K: Intrinsics matrix of shape (B, 3, 3)
-
+            face_bboxes: Tensor of shape (B, 4) with [x1, y1, x2, y2]
+                - [-1, -1, -1, -1] used to indicate no face detected
         Returns:
             Cropped image and updated intrinsics matrix
         """
@@ -239,13 +241,30 @@ class RandomBBoxCropper(object):
         images, bbox = self._possibly_pad_img(images, x1, y1, x2, y2)
         x1, y1, x2, y2 = bbox.T
 
+        if face_bboxes is not None:
+            # reposition face wrt new corner point
+            # scale this to target shape INTERNALLY (here)!
+            face_bboxes_new = face_bboxes.to(torch.float32)  # Convert to float for arithmetic operations
+            no_face_mask = face_bboxes[:,0] != -1
+            face_bboxes_new[no_face_mask, 0] = face_bboxes_new[no_face_mask, 0] - x1[no_face_mask].to(torch.float32)
+            face_bboxes_new[no_face_mask, 1] = face_bboxes_new[no_face_mask, 1] - y1[no_face_mask].to(torch.float32)
+            face_bboxes_new[no_face_mask, 2] = face_bboxes_new[no_face_mask, 2] - x1[no_face_mask].to(torch.float32)
+            face_bboxes_new[no_face_mask, 3] = face_bboxes_new[no_face_mask, 3] - y1[no_face_mask].to(torch.float32)
+            face_bboxes_new[no_face_mask] = face_bboxes_new[no_face_mask] * (576.0 / torch.maximum((x2 - x1)[no_face_mask].to(torch.float32), (y2 - y1)[no_face_mask].to(torch.float32)).unsqueeze(-1)) # ! HARDCODED to 576
+            face_bboxes_new[~no_face_mask] = -1 # just to ensure
+            # if any become out-of-bounds post random crop, then set to -1 as well
+            oob_mask = (face_bboxes_new < 0).any(dim=-1) | (face_bboxes_new > 576.0).any(dim=1)
+            face_bboxes_new[oob_mask] = -1
+            
+            face_bboxes_new = face_bboxes_new.to(torch.int32)  # Convert back to int32 for indexing
+
         # perform the actual crop
         cropped_images = []
         for i in range(len(images)):
             cropped_img = images[i][:, int(y1[i]):int(y2[i]), int(x1[i]):int(x2[i])]
             cropped_images.append(cropped_img)
 
-        return cropped_images, K_new, rel_bbox
+        return cropped_images, K_new, rel_bbox, face_bboxes_new if face_bboxes is not None else None
 
 
 def percent_to_absolute(arr, abs_arr):

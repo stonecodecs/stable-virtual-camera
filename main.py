@@ -5,7 +5,7 @@ import inspect
 import os
 import sys
 from inspect import Parameter
-from typing import Union
+from typing import Union, Optional
 
 import numpy as np
 import pytorch_lightning as pl
@@ -27,6 +27,7 @@ from seva.sampling import MultiviewCFG
 from sgm.util import exists, instantiate_from_config, isheatmap
 import matplotlib.cm as cm
 from matplotlib.image import imread
+import torch.nn.functional as F
 
 import threading
 import queue
@@ -337,6 +338,8 @@ class LogTask:
     # pl_module: pl.LightningModule
     logger: WandbLogger
     scale_factor: float
+    face_bbox: Optional[torch.Tensor] = None
+
 
 class ImageLogger(Callback):
     def __init__(
@@ -369,6 +372,7 @@ class ImageLogger(Callback):
         self.log_first_step = log_first_step
         self.log_before_first_step = log_before_first_step
         self.log_train = log_train
+        self.should_log_val = False
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         # for logging
         with torch.device("cpu"):
@@ -466,13 +470,13 @@ class ImageLogger(Callback):
             # Perform the actual logging
             self.log_local(
                 task.save_dir, task.split, images, masks,
-                task.global_step, task.current_epoch, task.batch_idx, task.logger, task.scale_factor    
+                task.global_step, task.current_epoch, task.batch_idx, task.logger, task.scale_factor, task.face_bbox    
             )
             
         except Exception as e:
-            self.logger.error(f"[ImageLogger] Error processing log task: {e}")
+            self.logger.error(f"[ImageLogger] Error processing log task: {e}", exc_info=True)
 
-    def _queue_log_task(self, save_dir, split, images, masks, global_step, current_epoch, batch_idx, logger, scale_factor):
+    def _queue_log_task(self, save_dir, split, images, masks, global_step, current_epoch, batch_idx, logger, scale_factor, face_bbox=None):
         """Queue a logging task for background processing"""
         if self.shutdown_event.is_set():
             self.logger.info("[ImageLogger] Logger is shutting down, skipping log task")
@@ -488,7 +492,8 @@ class ImageLogger(Callback):
             batch_idx=batch_idx,
             # pl_module=pl_module,
             logger=logger,
-            scale_factor=scale_factor
+            scale_factor=scale_factor,
+            face_bbox=face_bbox
         )
         
         try:
@@ -616,13 +621,18 @@ class ImageLogger(Callback):
         del border_tensor
         return bordered_image
 
+
+    @torch.no_grad()
+    def denormalize_image(self, tensor):
+        # Denormalize and convert to PIL image
+        tensor = (tensor + 1.0) / 2.0
+        tensor = torch.clamp(tensor, 0, 1)
+        return tensor
+
     @torch.no_grad()
     def tensor_to_image(self, tensor):
         # Denormalize and convert to PIL image
         tensor = tensor.cpu().squeeze(0)
-        tensor = tensor * 0.5 + 0.5  # Denormalize
-        # tensor = torch.clamp(tensor, 0, 1)
-        tensor = torch.clamp(tensor, 0, 1)
         return tensor
 
     @torch.no_grad()
@@ -646,6 +656,7 @@ class ImageLogger(Callback):
         batch_idx,
         logger,
         scale_factor,
+        face_bbox=None
         # pl_module: Union[None, pl.LightningModule] = None,
     ):
         root = os.path.join(save_dir, "images", split)
@@ -673,6 +684,7 @@ class ImageLogger(Callback):
             else:            
                 # SEVA multi-view tensors are already flattened in log_img to [N, C, H, W]
                 # Add colored borders based on image type
+                # for all (input, decoded clean_latent, samples):
                 bordered_images = []
                 for i, img in enumerate(images[k]):
                     # Determine border color based on image key or index
@@ -685,7 +697,7 @@ class ImageLogger(Callback):
                     if ref_mask[i]:
                         border_color = (0.0, 255.0, 0.0) # green
 
-                    img = self.tensor_to_image(img) # (-1, 1) ->(0, 1)
+                    img = self.denormalize_image(self.tensor_to_image(img)) # (-1, 1) ->(0, 1)
                     bordered_img = self.add_colored_border(img, border_color, border_width=24)
                     bordered_images.append(bordered_img)
                 
@@ -712,17 +724,14 @@ class ImageLogger(Callback):
                 os.makedirs(os.path.split(path)[0], exist_ok=True)
                 img = Image.fromarray(grid)
                 img.save(path)
-                if exists(logger):
-                    assert isinstance(
-                        logger, WandbLogger
-                    ), "logger_log_image only supports WandbLogger currently"
+                if isinstance(logger, WandbLogger):
                     logger.log_image(
                         key=f"{split}/{k}",
-                        images=[
-                            img,
-                        ],
+                        images=[img],
                         step=global_step,
                     )
+        
+        # log diffmap (HACK - just take the diffmap of the post-processed grid)
         if len(components_for_diffmap) == 2:
             diffmap = self.diffmap(components_for_diffmap[0], components_for_diffmap[1])
             filename = "{}_gs-{:06}_e-{:06}_b-{:06}.png".format(
@@ -733,20 +742,85 @@ class ImageLogger(Callback):
             os.makedirs(os.path.split(path)[0], exist_ok=True)
             diffmap_img = Image.fromarray(diffmap)
             diffmap_img.save(path)
-            if exists(logger):
+            if isinstance(logger, WandbLogger):
                 logger.log_image(
                     key=f"{split}/diffmap",
                     images=[diffmap_img],
                     step=global_step,
                 )
+        
+        # log face crops (only for non-reference frames)
+        if face_bbox is not None and "samples" in images and "reconstructions" in images:
+            face_crops_recon = []
+            face_crops_samples = []
+
+            num_images_to_log = face_bbox.shape[0]
+
+            for i in range(num_images_to_log):
+                # Skip reference frames (ground truth) since they're not samples from the model
+                if ref_mask[i]:
+                    continue
+                    
+                x1, y1, x2, y2 = face_bbox[i].long()
+                
+                # Skip invalid bboxes
+                if x1 < 0 or y1 < 0 or x1 >= x2 or y1 >= y2:
+                    continue
+
+                # Crop from each source
+                # Images are already decoded to RGB and are in range [-1, 1]
+                crop_recon = images["reconstructions"][i:i+1, :, y1:y2, x1:x2]
+                crop_sample = images["samples"][i:i+1, :, y1:y2, x1:x2]
+
+                # Resize to a standard size for visualization
+                target_size = (128, 128)
+
+                face_crops_recon.append(F.interpolate(crop_recon, size=target_size, mode='bilinear', align_corners=False))
+                face_crops_samples.append(F.interpolate(crop_sample, size=target_size, mode='bilinear', align_corners=False))
+            
+            if face_crops_recon:
+                # Interleave the crops: [recon1, sample1, recon2, sample2, ...]
+                interleaved_crops = []
+                for recon, sample in zip(face_crops_recon, face_crops_samples):
+                    interleaved_crops.extend([recon, sample])
+                
+                # Create a grid
+                grid = torchvision.utils.make_grid(torch.cat(interleaved_crops, dim=0), nrow=2) # 2 columns: Recon, Sample
+                
+                # Convert to savable format
+                grid = (grid + 1.0) / 2.0  # from [-1, 1] to [0, 1]
+                grid = grid.permute(1, 2, 0).to("cpu").numpy()
+                grid = (grid * 255).astype(np.uint8)
+
+                # Save the grid
+                filename = f"face_crops_gs-{global_step:06}_e-{current_epoch:06}_b-{batch_idx:06}.png"
+                path = os.path.join(root, filename)
+                self.logger.info(f"ImageLogger::Saving face crops to: {path}")
+                img = Image.fromarray(grid)
+                img.save(path)
+
+                # Log to wandb
+                if isinstance(logger, WandbLogger):
+                    logger.log_image(
+                        key=f"{split}/face_crops",
+                        images=[img],
+                        step=global_step,
+                    )
+
 
     @rank_zero_only
     def log_img(self, pl_module, batch, batch_idx, split="train", sample=True): #pl_module: DiffusionEngine
         check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
 
+        # Determine which flag to check based on split
+        if split == "val":
+            should_log = self.should_log_val
+        else:
+            should_log = getattr(self, "should_log_now", False)
+
         # check if we should log at this batch index
         if (
-            getattr(self, "should_log_now", False)
+            should_log
             # self.check_frequency(check_idx)
             and hasattr(pl_module, "log_images")  # batch_idx % self.batch_freq == 0
             and callable(pl_module.log_images)
@@ -864,6 +938,10 @@ class ImageLogger(Callback):
                 if sample:
                     pre_images["samples"] = samples
 
+                face_bbox = batch.get("face_bbox")
+                if face_bbox is not None:
+                    face_bbox = face_bbox[:N].reshape(-1, 4).detach().cpu()
+
                 # flatten for decoder
                 for k in pre_images: # images is dict{inputs, reconstructions, samples} (as in diffusion.py)
                     if isinstance(pre_images[k], torch.Tensor):
@@ -904,10 +982,20 @@ class ImageLogger(Callback):
                 #     pl_module.global_step, pl_module.current_epoch, batch_idx, pl_module
                 # )
 
+                # Resolve a robust save directory across different loggers
+                save_dir = getattr(pl_module.logger, "save_dir", None)
+                if not save_dir:
+                    save_dir = getattr(pl_module.logger, "log_dir", None)
+                if not save_dir and hasattr(pl_module, "trainer") and hasattr(pl_module.trainer, "logdir"):
+                    save_dir = pl_module.trainer.logdir
+                if not save_dir:
+                    save_dir = os.getcwd()
+
                 # add this iteration's images to the CPU-based logger queue
                 self._queue_log_task(
-                    pl_module.logger.save_dir, split, pre_images, masks,
-                    pl_module.global_step, pl_module.current_epoch, batch_idx, pl_module.logger, pl_module.scale_factor
+                    save_dir, split, pre_images, masks,
+                    pl_module.global_step, pl_module.current_epoch, batch_idx, pl_module.logger, pl_module.scale_factor,
+                    face_bbox=face_bbox
                 )
             
 
@@ -952,25 +1040,28 @@ class ImageLogger(Callback):
     # therefore, we don't use rank_zero_only and make other ranks wait for rank 0 to finish instead
     # @rank_zero_only
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if not self.log_train:
+        if not self.log_train or self.disabled:
             return # don't trigger any logs
-        check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
-        should_log = (
-            (not self.disabled)
-            and (pl_module.global_step > 0 or self.log_first_step)
-            and self.check_frequency(check_idx) # this mutates in-place, so it defines a self.should_log_now!
-        )
-        # All ranks enter the barrier before logging so collectives stay in order
-        if torch.distributed.is_available() and torch.distributed.is_initialized() and should_log:
-            torch.distributed.barrier()
 
-        # Only rank 0 actually does the heavy GPU work
-        if trainer.is_global_zero and should_log:
-            self.log_img(pl_module, batch, batch_idx, split="train")
+        should_log = 0.0
+        if trainer.is_global_zero:
+            check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
+            if (pl_module.global_step > 0 or self.log_first_step) and self.check_frequency(check_idx):
+                should_log = 1.0
 
-        # All ranks wait again before continuing to next step
-        if torch.distributed.is_available() and torch.distributed.is_initialized() and should_log:
-            torch.distributed.barrier()
+        should_log_tensor = torch.tensor(should_log, device=pl_module.device)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(should_log_tensor, src=0)
+
+        if should_log_tensor.item() == 1.0:
+            torch.distributed.barrier() # all ranks enter barrier when logging
+
+            if trainer.is_global_zero:
+                print(f"[ImageLogger] Logging images for train batch {batch_idx}")
+                self.log_img(pl_module, batch, batch_idx, split="train")
+
+            torch.distributed.barrier() # all wait for rank 0, then continue
+
 
     def on_exception(self, trainer, pl_module, exception):
         self.shutdown()
@@ -988,33 +1079,32 @@ class ImageLogger(Callback):
     # same reason as on_train_batch_end
     # ! also note: validation set should only sample very few images per num_iterations (maybe 1 or 2)
     # ! otherwise very long wait times just for logging, slowing down training
-    # @rank_zero_only
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, *args, **kwargs
     ):
+        # NOTE: we always fully sample and log the images for the first validation batch!
         # if not self.disabled and pl_module.global_step > 0:
         if self.disabled:
             return
-        print(f"Logging validation at {pl_module.global_step}")
-        self.should_log_now = True
-                # All ranks enter the barrier before logging so collectives stay in order
+
+        should_log = 1.0 if trainer.is_global_zero and self.should_log_val else 0.0
+        should_log_tensor = torch.tensor(should_log, device=pl_module.device)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(should_log_tensor, src=0)
+
+        if should_log_tensor.item() == 1.0:
+            torch.distributed.barrier() # all ranks enter barrier when logging
+
+            if trainer.is_global_zero and self.should_log_val:
+                self.log_img(pl_module, batch, batch_idx, split="val")
+                
             torch.distributed.barrier()
 
-        # Only rank 0 actually does the heavy GPU work
-        if trainer.is_global_zero and self.should_log_now:
-            self.log_img(pl_module, batch, batch_idx, split="val")
+        self.should_log_val = False
 
-        # All ranks wait again before continuing to next step
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
-        self.should_log_now = False
-        # if hasattr(pl_module, "calibrate_grad_norm"):
-        #     if (
-        #         pl_module.calibrate_grad_norm and batch_idx % 25 == 0
-        #     ) and batch_idx > 0:
-        #         self.log_gradients(trainer, pl_module, batch_idx=batch_idx)
+    def on_validation_epoch_start(self, trainer, pl_module):
+        pass # validation logging turned off for now
+        # self.should_log_val = True # reset for the next epoch (for first batch logging)
 
     # ! we disable testing for now, but otherwise, for distributed, we'd change this as well.
     @rank_zero_only
@@ -1166,6 +1256,12 @@ if __name__ == "__main__":
     cfgdir = os.path.join(logdir, "configs")
     seed_everything(opt.seed, workers=True)
 
+    # Set NCCL timeout to avoid timeouts on slower GPUs (e.g., A6000)
+    # Default is 1800 seconds (30 minutes), increase to 2 hours for safety
+    os.environ.setdefault('NCCL_TIMEOUT', '7200')  # 2 hours in seconds
+    os.environ.setdefault('NCCL_BLOCKING_WAIT', '1')  # Enable blocking wait for better error messages
+    print(f"NCCL timeout set to {os.environ['NCCL_TIMEOUT']} seconds")
+    
     # move before model init, in case a torch.compile(...) is called somewhere
     if opt.enable_tf32:
         # pt_version = version.parse(torch.__version__)
@@ -1293,6 +1389,7 @@ if __name__ == "__main__":
 
         # https://pytorch-lightning.readthedocs.io/en/stable/extensions/strategy.html
         # default to ddp if not further specified
+        from datetime import timedelta
         default_strategy_config = {"target": "pytorch_lightning.strategies.DDPStrategy"}
 
         if "strategy" in lightning_config:
@@ -1301,14 +1398,30 @@ if __name__ == "__main__":
             strategy_cfg = OmegaConf.create()
             default_strategy_config["params"] = {
                 "find_unused_parameters": False,
+                "timeout": 7200,  # 2 hours timeout in seconds (will be converted to timedelta)
                 # "static_graph": True,
                 # "ddp_comm_hook": default.fp16_compress_hook  # TODO: experiment with this, also for DDPSharded
             }
         strategy_cfg = OmegaConf.merge(default_strategy_config, strategy_cfg)
+        
+        # Extract and convert timeout from seconds to timedelta, then remove from config
+        timeout_seconds = None
+        if "params" in strategy_cfg and "timeout" in strategy_cfg.params:
+            timeout_seconds = strategy_cfg.params.timeout
+            # Remove timeout from config since OmegaConf can't handle timedelta objects
+            del strategy_cfg.params["timeout"]
+            print(f"Setting DDPStrategy timeout to {timeout_seconds} seconds ({timeout_seconds/3600:.1f} hours)")
+        
         print(
             f"strategy config: \n ++++++++++++++ \n {strategy_cfg} \n ++++++++++++++ "
         )
-        trainer_kwargs["strategy"] = instantiate_from_config(strategy_cfg)
+        
+        # Instantiate strategy and manually set timeout if needed
+        strategy = instantiate_from_config(strategy_cfg)
+        if timeout_seconds is not None:
+            strategy._timeout = timedelta(seconds=timeout_seconds)
+        
+        trainer_kwargs["strategy"] = strategy
 
         # add callback which sets up log directory
         default_callbacks_cfg = {

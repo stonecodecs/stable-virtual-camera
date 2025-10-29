@@ -77,6 +77,12 @@ class DiffusionEngine(pl.LightningModule):
             if loss_fn_config is not None
             else None
         )
+        
+        # Pass first_stage_model reference to loss for RGB decoding (if face perceptual loss is used)
+        if self.loss_fn is not None and hasattr(self.loss_fn, 'use_face_perceptual') and self.loss_fn.use_face_perceptual:
+            self.loss_fn.first_stage_model = self.first_stage_model
+            self.loss_fn.scale_factor = scale_factor
+            print(f"Face perceptual loss enabled: decoder and scale_factor ({scale_factor}) passed to loss_fn")
 
         self.use_ema = use_ema
         if self.use_ema:
@@ -320,7 +326,6 @@ class DiffusionEngine(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # TODO: add this in in place of training image logs (not tested yet)
         loss, loss_dict = self.shared_step(batch)
         # log averaged validation loss; keep per-step metrics off
         val_dict = {f"val_{k}": v for k, v in loss_dict.items()}

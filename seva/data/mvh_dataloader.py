@@ -115,10 +115,13 @@ class MVHumanNetDataset(Dataset):
         white_background=False,
         step_size=60,
         preload_path=None,
-        synthetic_dataset_path=None,
+        iclight_dataset_path=None,
+        infu_dataset_path=None,
+        face_bbox_dir=None,
         crop_padding=60, # used to prevent clipping of the humans
         use_inconsistent=False,
         random_crop_prob=0.3, # probability of using random crop over maximal
+        ic_sampling_prob=0.7, # probability of randomly sampling from InfU over IC light
         fixed_sampling_ids=None,
     ):
         self.root_dir = root_dir             # directory of all subject directories
@@ -138,6 +141,7 @@ class MVHumanNetDataset(Dataset):
         # NOTE: if the above is set to True, then latents_dir will be ignored
         # and latents will be computed on the fly!
         self.use_inconsistent = use_inconsistent
+        self.ic_sampling_prob = ic_sampling_prob
         # if True, then will concatenate all clean latents with these ic latents
         # if False, then will leave conditioning "black" for target images
         # and will repeat the clean latent for the input images
@@ -160,14 +164,26 @@ class MVHumanNetDataset(Dataset):
         self.all_inputs_prob = 0.8
         self.white_background = white_background
         self.preload_path = preload_path
-        self.synthetic_dataset_path = synthetic_dataset_path # IC-light/InfU output directory
+        self.iclight_dataset_path = iclight_dataset_path # IC-light output directory
+        self.infu_dataset_path = infu_dataset_path # InfU output directory
+        self.face_bbox_dir = face_bbox_dir # Face bounding box directory
         # if not None, will use the "phase 2" expected training process
+        self.infu_num_images = {} # Dict[subject_id: int] number of images in infu directory
+        if self.infu_dataset_path is not None:
+            subjects_to_parse = os.listdir(self.infu_dataset_path)
+            for subject_id in subjects_to_parse:
+                if subject_id in self.exclude:
+                    continue
+                if self.only_include is not None and subject_id not in self.only_include:
+                    continue
+                self.infu_num_images[subject_id] = len(os.listdir(os.path.join(self.infu_dataset_path, subject_id)))
 
         if self.num_images > 16: # if more than 16, disable trajectory NVS batching
             self.adjacent_frame_sampling_prob = 0.0
         self.crop_padding = crop_padding
         # actual data
         self.cam_params = {} # Dict[subject: (extrinsics, intrinsics, camera_scale)]
+        self.face_bboxes = self._load_face_bboxes() if face_bbox_dir is not None else None # * needs to be loaded BEFORE scenes!
         self.scenes = self._load_scenes() if preload_path is None else self._load_preloaded_filepaths()
         self.image_shape = (1500, 2048) # MVHumanNet images are 2048x1500
 
@@ -213,6 +229,27 @@ class MVHumanNetDataset(Dataset):
             cleaned_data[camera_id] = value
         return cleaned_data
 
+    def _load_face_bboxes(self):
+        """
+        Load face bboxes from a directory of sharded jsons, each structured as:
+        {
+            "<subject_id>": {
+                "<camera_id>": {
+                    "<timestep>": {
+                        "x1, y1, x2, y2, ley_eye, right_eye, left_lip, right_lip" keys
+                        (NOTE: x1, y1, x2, y2 are int, all others are 2-tuples of ints
+                    }...
+                }
+            }
+        }
+        NOTE: assumes that subject keys are all UNIQUE (should be true)
+        """
+        all_face_info = {}
+        for face_json in os.listdir(self.face_bbox_dir):
+            all_face_info.update(load_json(os.path.join(self.face_bbox_dir, face_json)))
+
+        return all_face_info
+
     def _load_preloaded_filepaths(self):
         """
         Load preloaded filepaths from a custom json file structured as:
@@ -224,7 +261,7 @@ class MVHumanNetDataset(Dataset):
                 "extrinsics": <dict: camera extrinsics>
                 "intrinsics": <list: camera intrinsics>
                 "camera_scale": <float: camera scale>
-                "annots": {"bbox": <list: bbox coords.>, "bbox_face": <list: face bbox coords.>}
+                "annots": {"bbox": <list: bbox coords.>, "bbox_face": <list: face bbox coords. NOTE: not used since they're unreliable>}
             }
         }
         The above structure gives all that we need to load the filepaths (reducing metadata reads by a lot!)
@@ -286,22 +323,35 @@ class MVHumanNetDataset(Dataset):
             for timestep in iterator:
                 try: # to get all cameras for this timestep (and ENSURE all cameras are present)
                     for camera in cameras:
-                        time_id = timestep if is_list_type else f"{timestep * 5:04d}"
+                        if isinstance(timestep, str) and timestep.endswith("_img.jpg"):
+                            timestep = int(timestep.split("_")[0])
+                        time_id = f"{timestep * 5:04d}"
                         image_path = os.path.join(subject_path, "images_lr", camera, f"{time_id}_img.jpg")
                         mask_path = os.path.join(subject_path, "fmask_lr", camera, f"{time_id}_img_fmask.png")
                         # annots_path = os.path.join(subject_path, "annots", camera, f"{time_id}_img.json")
                         bbox = annots['bbox'][camera][time_id]
-                        face_bbox = annots['bbox_face2d'][camera][time_id]
-                        if (bbox[2] - bbox[0]) == 0 or (bbox[3] - bbox[1]) == 0:
-                            print(f"Skipping subject {subject} camera {camera} timestep {timestep} because bbox is invalid")
-                            continue
+                        if self.face_bboxes is not None:
+                            # Handle missing face bbox data gracefully
+                            try:
+                                face_bbox_dict = self.face_bboxes[subject][camera][f"{time_id}_img.jpg"]
+                                if face_bbox_dict == {}:
+                                    face_bbox = [-1, -1, -1, -1] # indicates no face detected
+                                else:
+                                    face_bbox = [face_bbox_dict['x1'], face_bbox_dict['y1'], face_bbox_dict['x2'], face_bbox_dict['y2']]
+                            except KeyError:
+                                # Subject/camera/timestep not in face_bboxes - tag as no face
+                                face_bbox = [-1, -1, -1, -1]
+
+                            if face_bbox != [-1, -1, -1, -1] and ((bbox[2] - bbox[0]) == 0 or (bbox[3] - bbox[1]) == 0):
+                                print(f"Skipping subject {subject} camera {camera} timestep {timestep} because bbox is invalid")
+                                continue
 
                         subject_map[time_id][camera] = {
                                     'image_path': image_path,
                                     'mask_path': mask_path,
                                     'annots': {
                                         'bbox': bbox,
-                                        'bbox_face': face_bbox
+                                        'bbox_face': face_bbox if self.face_bboxes is not None else None
                                     }
                                 }
                 except Exception as e: # NOTE: this is a hack to ignore missing timesteps
@@ -397,7 +447,7 @@ class MVHumanNetDataset(Dataset):
                             timestep = entry.name.split('_')[0]
                             annots_json = load_json(os.path.join(annots_path, camera, f"{timestep}_img.json"))['annots'][0]
                             bbox = annots_json['bbox']
-                            bbox_face = annots_json['bbox_face2d']
+                            bbox_face = annots_json['bbox_face2d'] # ! not used
                             if bbox[2] - bbox[0] == 0 or bbox[3] - bbox[1] == 0:
                                 print(f"Skipping subject {subject} camera {camera} timestep {timestep} because bbox is invalid")
                                 continue
@@ -427,6 +477,16 @@ class MVHumanNetDataset(Dataset):
                     'timestep': timestep
                 })
         return scenes
+
+    def _get_infu_path(self, subject_id, timestep):
+        if self.infu_dataset_path is None:
+            return None
+        return self.infu_dataset_path + f"/{subject_id}/{timestep}_{subject_id}_img.png"
+
+    def _get_iclight_path(self, subject_id, timestep, camera):
+        if self.iclight_dataset_path is None:
+            return None
+        return self.iclight_dataset_path + f"/{subject_id}/{camera}/{timestep}_img.png"
 
     def __len__(self):
         return len(self.scenes)
@@ -524,11 +584,23 @@ class MVHumanNetDataset(Dataset):
             ref_mask[fix_frame_idx] = True # this becomes the fixed frame
             # input_frames_mask = ref_mask.clone()
 
-        if self.use_inconsistent:
+        if self.use_inconsistent and self.iclight_dataset_path is not None:
+            # get ic-light paths (corresponding to selected frame!)
             ic_paths = [path.replace("mv_captures", "relit_images").replace(".jpg", ".png") for path in sampled_image_paths]
+
+            # get infu paths (randomly sampled!)
+            if self.infu_dataset_path is not None and self.ic_sampling_prob > 0:
+                infu_num_images_in_directory = self.infu_num_images[subject_id]
+                infu_random_indices = np.random.choice(infu_num_images_in_directory, self.num_images, replace=False) + 1
+                infu_paths = [self._get_infu_path(subject_id, f"{infu_random_indices[i]:06d}") for i in range(self.num_images)]
+ 
+                # use a "mask" to determine which of the ic paths are from ic-light and which are from infu
+                ic_mask = torch.rand(self.num_images) <= self.ic_sampling_prob
+                ic_paths = [ic_paths[i] if ic_mask[i] else infu_paths[i] for i in range(self.num_images)]
+
             ic_rgb = []
             tensorize = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
-            for i, ic_path in enumerate(ic_paths):
+            for ic_path in ic_paths:
                 ic_image = Image.open(ic_path).convert("RGB")
                 ic_rgb.append(tensorize(ic_image)) # these can be different image shapes originally
             # ! NOTE: only works with IC-light; need to combine with InfU later (combine in filesystem or sample)
@@ -561,20 +633,21 @@ class MVHumanNetDataset(Dataset):
         if self.random_crop or self.maximal_crop:
             annots_jsons = [frames_info[cam]["annots"] for cam in camera_order]
             crop_params = []
+            face_bboxes_adjusted = []
             for annots_json in annots_jsons:
                 bbox = annots_json['bbox'][:4]
-                face_bbox = annots_json['bbox_face'][:4]
-                crop_params.append((bbox, face_bbox))
+                face_bbox = annots_json['bbox_face'][:4] if self.face_bboxes is not None else [-1, -1, -1, -1] # this is from facebbox dir
+                crop_params.append(bbox)
+                face_bboxes_adjusted.append(face_bbox)
             # account for mvhn downsampling (hence the 0.5)
             # ! big HACK: after 103000+, the annotations are not scaled by 0.5 anymore!
             bbox_annot_scale = 0.5 if int(subject_id) < 103000 else 1.0
-            bbox_params = torch.stack([torch.tensor(bbox) * bbox_annot_scale for bbox, _ in crop_params])
-            # face_params = torch.stack([torch.tensor(face_bbox) * 0.5 for _, face_bbox in crop_params])
-            # apparently, face bbox data isn't really        
-            # crop_config = {
-            #     "center_mean": torch.mean(face_params.reshape(-1,2,2).permute(0,2,1), dim=2),
-            # }
-            frames, Ks, rel_bbox = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float())
+            bbox_params = torch.stack([torch.tensor(bbox) * bbox_annot_scale for bbox in crop_params])
+
+            # account for mvhn downsampling (hence the 0.5)
+            # ! big HACK: after 103000+, the annotations are not scaled by 0.5 anymore!
+            face_params = torch.stack([torch.tensor(face_bbox) for face_bbox in face_bboxes_adjusted]) if self.face_bboxes is not None else torch.stack([torch.tensor([-1, -1, -1, -1]) for _ in range(self.num_images)])
+            frames, Ks, rel_bbox, face_bboxes_adjusted = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=face_params)
             # NOTE: rel_bbox is the delta from the deterministic crop to the random crop
             # this would then be all 0 if not using random_crop
             # for ic-light, we would later need to scale these by the scale factor (1024->576)
@@ -596,6 +669,21 @@ class MVHumanNetDataset(Dataset):
             Ks = normalize_intrinsics(Ks, self.target_shape[0], self.target_shape[1]) # normalize intrinsics (H,W)
             Ks = repeat(Ks, 'd1 d2 -> n d1 d2', n=self.num_images) # assumes all intrinsics are the same 
             Ks = torch.from_numpy(Ks).float()
+            # face bboxes can be found
+            annots_jsons = [frames_info[cam]["annots"] for cam in camera_order]
+            face_bboxes_adjusted = []
+            for annots_json in annots_jsons:
+                face_bbox = annots_json['bbox_face'][:4] # this is from facebbox dir
+                face_bboxes_adjusted.append(face_bbox)
+                if face_bbox != [-1, -1, -1, -1]:
+                    # x1,x2 are affected by the center crop
+                    # ! assumes center crop is always horizontal (HARDCODED)
+                    face_bbox[0] = face_bbox[0] - crop_amount
+                    face_bbox[2] = face_bbox[2] - crop_amount
+            # account for mvhn downsampling (hence the 0.5)
+            # ! big HACK: after 103000+, the annotations are not scaled by 0.5 anymore!
+            face_params = torch.stack([torch.tensor(face_bbox) for face_bbox in face_bboxes_adjusted])
+            face_bboxes_adjusted = face_params * scale_amount
 
         # NOTE: the behavior of transform will change depending on whether random crop is used
         # frames = [self.transform(frame) for frame in frames]
@@ -697,7 +785,9 @@ class MVHumanNetDataset(Dataset):
                 "replace": replace, # contains pre-scaled clean latents!
                 "c2w": c2ws,
                 "K": Ks,
-                "use_inconsistent": self.use_inconsistent
+                "use_inconsistent": self.use_inconsistent,
+                "face_bbox": face_bboxes_adjusted  # Face bounding boxes [T, 4] in pixel coords (x1, y1, x2, y2)
+                # NOTE: face_bbox is w.r.t post-cropping, resized 576^2 image!
             }
         except Exception as e:
             print(f"Error creating output_dict: {e}")
@@ -731,12 +821,15 @@ class MVHumanNetLoader(pl.LightningDataModule):
         exclude: list = None,
         step_size: int = 150,
         preload_path: str = None,
-        synthetic_dataset_path: str = None,
+        iclight_dataset_path: str = None,
+        infu_dataset_path: str = None,
+        face_bbox_dir: str = None,
         random_crop: bool = False,
         maximal_crop: bool = True,
         val_include: list = None,
         use_inconsistent: bool = False,
         random_crop_prob: float = 0.3,
+        ic_sampling_prob: float = 0.7,
         fixed_sampling_ids: list = None
     ):
         super().__init__()
@@ -752,12 +845,15 @@ class MVHumanNetLoader(pl.LightningDataModule):
         self.exclude = exclude
         self.step_size = step_size
         self.preload_path = preload_path
-        self.synthetic_dataset_path = synthetic_dataset_path
+        self.iclight_dataset_path = iclight_dataset_path
+        self.infu_dataset_path = infu_dataset_path
+        self.face_bbox_dir = face_bbox_dir
         self.random_crop = random_crop
         self.maximal_crop = maximal_crop
         self.val_include = val_include
         self.use_inconsistent = use_inconsistent
         self.random_crop_prob = random_crop_prob
+        self.ic_sampling_prob = ic_sampling_prob
         self.fixed_sampling_ids = fixed_sampling_ids
         # Define transforms
         # self.transform = T.Compose([
@@ -771,6 +867,12 @@ class MVHumanNetLoader(pl.LightningDataModule):
                     self.only_include = [line.strip() for line in f]
             else:
                 self.only_include = expand_only_include(self.only_include)
+        if isinstance(self.exclude, str): # in the format ex: "100001-102000,102020-104000"
+            if os.path.exists(self.exclude): # if passed in a file (subject numbers on each line)
+                with open(self.exclude, 'r') as f:
+                    self.exclude = [line.strip() for line in f]
+            else:
+                self.exclude = expand_only_include(self.exclude)
         if isinstance(self.val_include, str): # in the format ex: "100001-102000,102020-104000"
             if os.path.exists(self.val_include): # if passed in a file (subject numbers on each line)
                 with open(self.val_include, 'r') as f:
@@ -793,11 +895,14 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 exclude=self.exclude,
                 step_size=self.step_size,
                 preload_path=self.preload_path,
-                synthetic_dataset_path=self.synthetic_dataset_path,
+                iclight_dataset_path=self.iclight_dataset_path,
+                infu_dataset_path=self.infu_dataset_path,
+                face_bbox_dir=self.face_bbox_dir,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
                 random_crop_prob=self.random_crop_prob,
+                ic_sampling_prob=self.ic_sampling_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
             )
 
@@ -813,10 +918,13 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 exclude=self.exclude,
                 step_size=self.step_size, # don't want too many samples for validation set
                 preload_path=self.preload_path,
-                synthetic_dataset_path=self.synthetic_dataset_path,
+                iclight_dataset_path=self.iclight_dataset_path,
+                infu_dataset_path=self.infu_dataset_path,
+                face_bbox_dir=self.face_bbox_dir,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
+                ic_sampling_prob=self.ic_sampling_prob,
                 random_crop_prob=self.random_crop_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
             )
@@ -831,10 +939,13 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 exclude=self.exclude,
                 step_size=self.step_size,
                 preload_path=self.preload_path,
-                synthetic_dataset_path=self.synthetic_dataset_path,
+                iclight_dataset_path=self.iclight_dataset_path,
+                infu_dataset_path=self.infu_dataset_path,
+                face_bbox_dir=self.face_bbox_dir,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
+                ic_sampling_prob=self.ic_sampling_prob,
                 random_crop_prob=self.random_crop_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
             )

@@ -2,12 +2,51 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ...modules.autoencoding.lpips.loss.lpips import LPIPS
 from ...modules.encoders.modules import GeneralConditioner
 from ...util import append_dims, instantiate_from_config
 from .denoiser import Denoiser
+ 
 
+def pad_to(latent, target_size, relative=False):
+    """
+    Center pads the latent to a target size.
+    If relative, then we pad relative to the CURRENT size of 'latent'.
+    Relative padding makes target_size 4D tensor for the padding values
+    (from 2nd return value of this function!)
+    (NOTE: if RGB image is 'latent' this will be used to pad the RGB image correspondingly.)
+    """
+    # latent is [B, C, H, W]
+    B, C, H, W = latent.shape
+
+    if relative:
+        # then padding is actually 4D!
+        return torch.nn.functional.pad(latent, target_size) \
+               , (0, 0, 0, 0) # save padding values
+
+    if isinstance(target_size, int):
+        target_size = (target_size, target_size)
+        
+    H_target, W_target = target_size
+
+    if H == H_target and W == W_target:
+        return latent, (0, 0, 0, 0)
+    
+    # Calculate padding for height
+    pad_h_total = max(0, H_target - H)
+    pad_top = pad_h_total // 2
+    pad_bottom = pad_h_total - pad_top
+    
+    # Calculate padding for width
+    pad_w_total = max(0, W_target - W)
+    pad_left = pad_w_total // 2
+    pad_right = pad_w_total - pad_left
+    
+    # The padding format is (pad_left, pad_right, pad_top, pad_bottom)
+    return torch.nn.functional.pad(latent, (pad_left, pad_right, pad_top, pad_bottom)) \
+           , (pad_left, pad_right, pad_top, pad_bottom) # save padding values
 
 class StandardDiffusionLoss(nn.Module):
     def __init__(
@@ -17,6 +56,10 @@ class StandardDiffusionLoss(nn.Module):
         loss_type: str = "l2",
         offset_noise_level: float = 0.0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
+        use_face_perceptual: bool = False, # ! - computationally intractable, legacy
+        face_perceptual_weight: float = 0.3,
+        face_crop_size: int = 128,
+        face_weighting: float = 0.0,
     ):
         super().__init__()
 
@@ -27,9 +70,28 @@ class StandardDiffusionLoss(nn.Module):
 
         self.loss_type = loss_type
         self.offset_noise_level = offset_noise_level
+        self.use_face_perceptual = use_face_perceptual
+        self.face_perceptual_weight = face_perceptual_weight
+        self.face_crop_size = face_crop_size
+        self.face_weighting = face_weighting # how much to weigh the face over the rest
+        # 0.0 -> no extra face weighting, spatially uniform loss weighting
+        # NOTE: this is different from using face_perceptual_weight
+        # as this creates a "weighting mask" in the latent space
+        # and applies to regular L2 loss.
+        
+        # Store reference to first_stage_model for RGB decoding (set externally)
+        self.first_stage_model = None
+        self.scale_factor = None
 
         if loss_type == "lpips":
             self.lpips = LPIPS().eval()
+        
+        # Initialize LPIPS for face perceptual loss if needed
+        if self.use_face_perceptual:
+            if not hasattr(self, 'lpips'):
+                self.lpips = LPIPS().eval()
+            for param in self.lpips.parameters():
+                param.requires_grad = False
 
         if not batch2model_keys:
             batch2model_keys = []
@@ -94,22 +156,218 @@ class StandardDiffusionLoss(nn.Module):
             w = append_dims(self.loss_weighting(sigmas, cond["mask"], batch["ref_mask"]), input.ndim) # replace with ref_mask
         else:
             w = append_dims(self.loss_weighting(sigmas), input.ndim)
-        return self.get_loss(model_output, input, w)
+        # Compute base loss
+        base_loss = self.get_loss(model_output, input, w, face_bbox=batch.get("face_bbox"), ref_mask=batch.get("ref_mask"), enable_face_weighting=self.face_weighting > 0.0)
+        
+        # Add face perceptual loss if enabled
+        if self.use_face_perceptual and "face_bbox" in batch:
+            # input is "clean_latent"
+            # in face loss, we work in RGB space, so we use batch["frames"]
+            # for LPIPS comparisons over the face
+            try: 
+                face_loss = self.get_face_crop_perceptual_loss(model_output, input, batch)
+            except Exception as e: # for any error, just continue with no face loss
+                print(f"Error in face perceptual loss: {e}")
+                face_loss = torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
+            total_loss = base_loss + self.face_perceptual_weight * face_loss
+            return total_loss
+        
+        return base_loss
 
-    def get_loss(self, model_output, target, w):
+    def get_face_weighting_loss(self, face_bbox, spatial_loss, ref_mask):
+        """
+        Compute weighted loss that emphasizes face regions.
+        
+        Args:
+            face_bbox: [B, T, 4] in pixel coords (x1, y1, x2, y2)
+            spatial_loss: [B, T, C, H, W] spatial loss map
+            ref_mask: [B, T] boolean tensor indicating reference frames (should be excluded)
+            
+        Returns:
+            Face-weighted loss scalar per batch element [B]
+        """
+        B, T, C, H, W = spatial_loss.shape
+        
+        # Create spatial mask for face regions
+        spatial_mask = torch.zeros_like(spatial_loss, dtype=torch.bool)
+        
+        # Loop through batch and time to mark face regions
+        for b in range(B):
+            for t in range(T):
+                # Skip reference frames (ground truth)
+                if ref_mask[b, t]:
+                    continue
+                    
+                x1, y1, x2, y2 = face_bbox[b, t].long()
+                
+                # Skip invalid bboxes
+                if x1 < 0 or y1 < 0 or x1 >= x2 or y1 >= y2:
+                    continue
+                
+                # Convert pixel coords to latent coords (8x downsampling)
+                x1_lat = (x1 // 8).clamp(0, W - 1)
+                y1_lat = (y1 // 8).clamp(0, H - 1)
+                x2_lat = (x2 // 8).clamp(1, W)
+                y2_lat = (y2 // 8).clamp(1, H)
+                
+                if x1_lat >= x2_lat or y1_lat >= y2_lat:
+                    continue
+                
+                # Mark face region in mask
+                spatial_mask[b, t, :, y1_lat:y2_lat, x1_lat:x2_lat] = True
+        
+        # If no valid faces, return zero for all batch elements
+        if not spatial_mask.any():
+            return torch.zeros(B, device=spatial_loss.device, dtype=spatial_loss.dtype)
+        
+        # Compute face loss per batch element separately
+        face_loss = torch.zeros(B, device=spatial_loss.device, dtype=spatial_loss.dtype)
+        for b in range(B):
+            batch_mask = spatial_mask[b]
+            if batch_mask.any():
+                face_loss[b] = torch.mean(spatial_loss[b][batch_mask])
+        
+        return face_loss
+
+
+    def get_loss(self, model_output, target, w, face_bbox=None, ref_mask=None, enable_face_weighting=False):
+        # add face weighting if face_weighting > 0.0
+        additional_loss = torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
+ 
         if self.loss_type == "l2":
-            return torch.mean(
-                (w * (model_output - target) ** 2).reshape(target.shape[0], -1), 1
+            spatial_loss = w * (model_output - target) ** 2 # [B, T, C, H, W]
+            loss = torch.mean(
+                spatial_loss.reshape(target.shape[0], -1), 1
             )
+            if enable_face_weighting and face_bbox is not None and ref_mask is not None:
+                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss, ref_mask)
+                loss = loss + additional_loss
+            return loss
         elif self.loss_type == "l1":
-            return torch.mean(
-                (w * (model_output - target).abs()).reshape(target.shape[0], -1), 1
+            spatial_loss = w * (model_output - target).abs()
+            loss = torch.mean(
+                spatial_loss.reshape(target.shape[0], -1), 1
             )
+            if enable_face_weighting and face_bbox is not None and ref_mask is not None:
+                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss, ref_mask)
+                loss = loss + additional_loss
+            return loss
         elif self.loss_type == "lpips":
             loss = self.lpips(model_output, target).reshape(-1)
+            if enable_face_weighting and face_bbox is not None and ref_mask is not None:
+                additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, loss, ref_mask)
+                loss = loss + additional_loss
             return loss
         else:
             raise NotImplementedError(f"Unknown loss type {self.loss_type}")
+
+    def get_face_crop_perceptual_loss(
+        self,
+        model_output: torch.Tensor,  # Predicted latents [B, T, C, H, W]
+        target: torch.Tensor,        # Target latents [B, T, C, H, W] (not used, gt_frames is used instead)
+        batch: Dict,
+    ) -> torch.Tensor:
+        """
+        Compute perceptual loss on face-cropped regions in RGB space.
+        Only processes non-reference frames (where ref_mask is False).
+        1. Decodes full latents to full RGB images.
+        2. Crops face regions from the decoded RGB images and ground-truth frames.
+        3. Resizes all crops to a uniform size.
+        4. Computes LPIPS loss on the RGB face crops.
+        """
+        # Check if decoder is available
+        if self.first_stage_model is None or self.scale_factor is None:
+            raise RuntimeError(
+                "first_stage_model and scale_factor must be set before using face perceptual loss."
+            )
+
+        B, T, C, H, W = model_output.shape # H, W are latent dim 72x72 spatial dims
+
+        # cropped model output (assuming that face output is in the same position)
+        face_bboxes_flat = batch["face_bbox"].reshape(B * T, 4)
+        ref_mask_flat = batch["ref_mask"].reshape(B * T)  # Flatten ref_mask to match
+        model_output = model_output.reshape(B * T, C, H, W)
+        rgb_gt = batch["frames"].reshape(B * T, 3, H * 8, W * 8) # these are 576^2
+        
+        # Get face bounding boxes and flatten them
+        cropped_pred_latents = []
+        cropped_gt_rgbs = []
+
+        # 2. Loop through the batch to CROP the RGB images (skip reference frames)
+        for i in range(B * T):
+            # Skip reference frames (ground truth)
+            if ref_mask_flat[i]:
+                continue
+                
+            x1, y1, x2, y2 = face_bboxes_flat[i].long()
+            
+            if x1 < 0 or y1 < 0 or x1 >= x2 or y1 >= y2:
+                continue
+            
+            x1_lat, y1_lat = x1//8, y1//8
+            x2_lat, y2_lat = x2//8, y2//8
+
+            if x1_lat >=x2_lat or y1_lat >= y2_lat:
+                continue
+                
+            # crop the "face region" @ the latent level
+            # latents are spatially aligned well enough for this to be valid
+            pred_crop = model_output[i:i+1, :, y1_lat:y2_lat, x1_lat:x2_lat]
+            gt_crop = rgb_gt[i:i+1, :, y1:y2, x1:x2] # this is in RGB space
+            
+            cropped_pred_latents.append(pred_crop)
+            cropped_gt_rgbs.append(gt_crop)
+
+        # If no valid faces were found in the batch, return zero loss
+        # NOTE: why not return 0 tensor?
+        # >> A: need dummy run to keep the comp. graph static and avoid deadlocks during multi-gpu training
+        # need to experiment more if this is "worth it" compared to overhead from dynamic comp. graph
+        if not cropped_pred_latents:
+            dummy_latent = torch.zeros(1, C, 1, 1, device=model_output.device, dtype=model_output.dtype)
+            dummy_pred_rgb = self.first_stage_model.decode(dummy_latent)
+            dummy_gt_rgb = torch.zeros_like(dummy_pred_rgb)
+            dummy_loss = self.lpips(dummy_pred_rgb, dummy_gt_rgb)
+            return dummy_loss.mean() * 0.0
+
+        # get maximum spatial size of crops
+        # will be used for stacking and corresponding RGB GT padding
+        # to align with the padded latent stack
+        # Why? -> takes around 20s/iter based on the list approach.
+        # This takes [TBD].
+        max_W = max(crop.shape[-1] for crop in cropped_pred_latents)
+        max_H = max(crop.shape[-2] for crop in cropped_pred_latents)
+
+        # If faces are found, pad latents to uniform size
+        decoded_crop_latents = []
+        rel_padding = []
+        for crop in cropped_pred_latents:
+            padded_crop, rel_pad = pad_to(crop, (max_H, max_W), relative=False)
+            decoded_crop_latents.append(padded_crop)
+            rel_padding.append(rel_pad)
+
+        # stack and decode
+        decoded_crop_latents = self.first_stage_model.decode(torch.cat(decoded_crop_latents, dim=0))
+
+        # pad the RGB GTs accordingly with zero-pad
+        # to "align" with the padded decoded latents
+        # also, resize to target size
+        padded_gt_rgbs = []
+        for crop, rel_pad in zip(cropped_gt_rgbs, rel_padding):
+            padded_crop, rel_pad = pad_to(crop, [pad * 8 for pad in rel_pad], relative=True)
+            padded_gt_rgbs.append(F.interpolate(padded_crop, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False))
+
+        padded_gt_rgbs = torch.cat(padded_gt_rgbs, dim=0)
+
+        # 3. Resize decoded latents to a fixed size (in RGB space)
+        # matching the padded_gt_rgbs
+        resized_pred_crops = torch.cat([
+            F.interpolate(decoded_crop_latents, size=(self.face_crop_size, self.face_crop_size), mode='bilinear', align_corners=False)
+        ], dim=0)
+        
+        # 4. Compute LPIPS loss on the batched, resized RGB crops
+        # chunk_size = 4 -- use later if no space
+        lpips_loss = self.lpips(resized_pred_crops, padded_gt_rgbs)
+        return lpips_loss.mean()
 
 def interpolate_weights_batch(bools: torch.Tensor, max_weight=5.0) -> torch.Tensor:
     B, N = bools.shape

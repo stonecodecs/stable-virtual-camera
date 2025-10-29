@@ -1,7 +1,6 @@
 export NCCL_SOCKET_IFNAME=lo
 python main.py \
---base configs/example_training/seva-phase2.yaml \
---wandb \
+--base configs/example_training/gen-seva-infu.yaml \
 --projectname seva-on-mvhsamples \
 --no-test \
 --override_ngpu 0,
