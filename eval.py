@@ -6,6 +6,7 @@ from sgm.models.diffusion import DiffusionEngine
 from eval_utils import normalize_tensor
 from eval_utils import show_tensor_batch
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from tqdm import tqdm
 
 import torch 
 import os
@@ -88,12 +89,9 @@ os.makedirs("output_samples", exist_ok=True)
 predicted_samples = []
 target_images = []
 
-for batch in loader:
+for batch in tqdm(loader):
     batch_ = batch.copy()
     samples = run_step(batch_, engine, scale=1.0)
-    torch.save(batch['c2w'], "output_samples/c2w.pt")
-    torch.save(batch['K'], "output_samples/K.pt")
-    torch.save(batch['ref_mask'], "output_samples/ref_mask.pt")
     decoded_samples = normalize_tensor(engine.decode_first_stage(samples)).to("cpu")
 
     # Don't show images during evaluation
