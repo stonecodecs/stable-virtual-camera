@@ -118,6 +118,7 @@ class MVHumanNetDataset(Dataset):
         iclight_dataset_path=None,
         infu_dataset_path=None,
         face_bbox_dir=None,
+        arcface_embeddings_dir=None,
         crop_padding=60, # used to prevent clipping of the humans
         use_inconsistent=False,
         random_crop_prob=0.3, # probability of using random crop over maximal
@@ -167,6 +168,9 @@ class MVHumanNetDataset(Dataset):
         self.iclight_dataset_path = iclight_dataset_path # IC-light output directory
         self.infu_dataset_path = infu_dataset_path # InfU output directory
         self.face_bbox_dir = face_bbox_dir # Face bounding box directory
+        self.arcface_embeddings_dir = arcface_embeddings_dir # ArcFace embeddings directory
+        # NOTE: currently we only have arcface_embeddings for MVHN gt dataset
+    
         # if not None, will use the "phase 2" expected training process
         self.infu_num_images = {} # Dict[subject_id: int] number of images in infu directory
         if self.infu_dataset_path is not None:
@@ -184,6 +188,7 @@ class MVHumanNetDataset(Dataset):
         # actual data
         self.cam_params = {} # Dict[subject: (extrinsics, intrinsics, camera_scale)]
         self.face_bboxes = self._load_face_bboxes() if face_bbox_dir is not None else None # * needs to be loaded BEFORE scenes!
+        self.arcface_embeddings = self._load_arcface_embeddings() if arcface_embeddings_dir is not None else None
         self.scenes = self._load_scenes() if preload_path is None else self._load_preloaded_filepaths()
         self.image_shape = (1500, 2048) # MVHumanNet images are 2048x1500
 
@@ -249,6 +254,35 @@ class MVHumanNetDataset(Dataset):
             all_face_info.update(load_json(os.path.join(self.face_bbox_dir, face_json)))
 
         return all_face_info
+
+    def _load_arcface_embeddings(self):
+        """
+        Loads ArcFace embeddings analogously to face bboxes.
+        """
+        all_arcface_info = {"gt": {}}
+        subdirs = []
+        for arcface_json in os.listdir(self.arcface_embeddings_dir):
+            if arcface_json.endswith(".json"):
+                all_arcface_info["gt"].update(load_json(os.path.join(self.arcface_embeddings_dir, arcface_json)))
+            elif os.path.isdir(os.path.join(self.arcface_embeddings_dir, arcface_json)):
+                subdirs.append(arcface_json)
+
+        for subdir in subdirs: # these would be 'relit_images' or 'inconsistent_images'
+            # HACK (but just change the names later)
+            if subdir == "relit_images":     
+                subdir_name = "iclight"
+            elif subdir == "inconsistent_images":
+                subdir_name = "infu"
+            elif subdir == "gt":
+                raise ValueError(f"ArcFace embeddings folder should NOT have a 'gt' subdirectory!")
+            else:
+                raise ValueError(f"Unknown subdirectory: {subdir}")
+            all_arcface_info[subdir_name] = {}
+            for sub_json in os.listdir(os.path.join(self.arcface_embeddings_dir, subdir)):
+                if sub_json.endswith(".json"):
+                    all_arcface_info[subdir_name].update(load_json(os.path.join(self.arcface_embeddings_dir, subdir, sub_json)))
+
+        return all_arcface_info
 
     def _load_preloaded_filepaths(self):
         """
@@ -330,6 +364,10 @@ class MVHumanNetDataset(Dataset):
                         mask_path = os.path.join(subject_path, "fmask_lr", camera, f"{time_id}_img_fmask.png")
                         # annots_path = os.path.join(subject_path, "annots", camera, f"{time_id}_img.json")
                         bbox = annots['bbox'][camera][time_id]
+                        # Initialize defaults
+                        face_bbox = [-1, -1, -1, -1]
+                        arcface_embedding = None
+                        
                         if self.face_bboxes is not None:
                             # Handle missing face bbox data gracefully
                             try:
@@ -346,14 +384,29 @@ class MVHumanNetDataset(Dataset):
                                 print(f"Skipping subject {subject} camera {camera} timestep {timestep} because bbox is invalid")
                                 continue
 
+                        if self.arcface_embeddings is not None:
+                            try:
+                                arcface_embedding = self.arcface_embeddings["gt"][subject][camera][f"{time_id}_img.jpg"]
+                            except KeyError:
+                                arcface_embedding = None
+
                         subject_map[time_id][camera] = {
                                     'image_path': image_path,
                                     'mask_path': mask_path,
                                     'annots': {
                                         'bbox': bbox,
-                                        'bbox_face': face_bbox if self.face_bboxes is not None else None
+                                        'bbox_face': face_bbox if self.face_bboxes is not None else None,
+                                        'arcface_embedding': arcface_embedding if self.arcface_embeddings is not None else None
                                     }
                                 }
+                        if self.arcface_embeddings is not None:
+                            try:
+                                subject_map[time_id][camera]['annots']['arcface_embedding_iclight'] = self.arcface_embeddings["iclight"][subject][camera][f"{time_id}_img.png"]
+                            except KeyError:
+                                try:
+                                    subject_map[time_id][camera]['annots']['arcface_embedding_infu'] = self.arcface_embeddings["infu"][subject][camera][f"{time_id}_img.png"]
+                                except KeyError:
+                                    pass
                 except Exception as e: # NOTE: this is a hack to ignore missing timesteps
                     print(f"Error loading subject {subject} camera {camera} timestep {timestep}: {e}")
                     subject_map.pop(time_id, None) # remove this timestep from the subject_map
@@ -577,13 +630,16 @@ class MVHumanNetDataset(Dataset):
         if not self.use_inconsistent: # phase 1
             # since inputs are all consistent in dataset, we can use multiple "references"
             ref_mask = input_frames_mask.clone()
+            self.ref_mask = ref_mask
         else:
             # inputs will all be inconsistent, and we can only fix to a "single reference"
             ref_mask = torch.zeros(self.num_images, dtype=torch.bool)
             fix_frame_idx = input_frames_indices[np.random.choice(len(input_frames_indices), 1).item()]
             ref_mask[fix_frame_idx] = True # this becomes the fixed frame
+            self.ref_mask = ref_mask
             # input_frames_mask = ref_mask.clone()
 
+        ic_mask = None  # Initialize ic_mask
         if self.use_inconsistent and self.iclight_dataset_path is not None:
             # get ic-light paths (corresponding to selected frame!)
             ic_paths = [path.replace("mv_captures", "relit_images").replace(".jpg", ".png") for path in sampled_image_paths]
@@ -595,6 +651,7 @@ class MVHumanNetDataset(Dataset):
                 infu_paths = [self._get_infu_path(subject_id, f"{infu_random_indices[i]:06d}") for i in range(self.num_images)]
  
                 # use a "mask" to determine which of the ic paths are from ic-light and which are from infu
+                # if True, then using IClight, otherwise InfU
                 ic_mask = torch.rand(self.num_images) <= self.ic_sampling_prob
                 ic_paths = [ic_paths[i] if ic_mask[i] else infu_paths[i] for i in range(self.num_images)]
 
@@ -607,7 +664,43 @@ class MVHumanNetDataset(Dataset):
         else: # if not, then just 0 tensor
             ic_rgb = torch.zeros((self.num_images, 3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
 
-
+        arcface_embeddings = []
+        if self.arcface_embeddings is not None:
+            if ic_mask is not None: # if using InfU + IC-light
+                for is_infu, cam in zip(ic_mask, camera_order):
+                    # TODO: get InfU and IC-light embeddings separately
+                    # For now, use ground truth embedding
+                    try:
+                        arcface_embedding = frames_info[cam]['annots']['arcface_embedding']
+                    except KeyError:
+                        arcface_embedding = None
+                    arcface_embeddings.append(arcface_embedding)
+            else: # if only using IC-light or no ic
+                for is_ref, cam in zip(self.ref_mask, camera_order):
+                    # For reference frames, use GT embedding
+                    # For target frames, also use GT for training
+                    # TODO: For IC-light conditioned frames, load IC-light embeddings
+                    try:
+                        if is_ref:
+                            arcface_embedding = frames_info[cam]['annots']['arcface_embedding']
+                        else:
+                            arcface_embedding = frames_info[cam]['annots']['arcface_embedding_iclight']
+                    except KeyError:
+                        arcface_embedding = None
+                    arcface_embeddings.append(arcface_embedding)
+            
+            # Convert to tensor [T, 512]
+            # Handle None values by replacing with zeros
+            arcface_embeddings = [
+                torch.tensor(emb) if emb is not None else torch.zeros(512)
+                for emb in arcface_embeddings
+            ]
+            arcface_embeddings = torch.stack(arcface_embeddings)
+            arcface_embeddings[~input_frames_mask] *= 0
+            # don't use arcface embedding for target frames
+        # NOTE: it's possible that we can just average all of these out
+        # to get the average face embedding (which proves to be effective in the InstantID paper)
+            
         camera_mask = torch.ones(self.num_images, dtype=torch.bool)
 
         def get_c2w(cam):
@@ -647,7 +740,9 @@ class MVHumanNetDataset(Dataset):
             # account for mvhn downsampling (hence the 0.5)
             # ! big HACK: after 103000+, the annotations are not scaled by 0.5 anymore!
             face_params = torch.stack([torch.tensor(face_bbox) for face_bbox in face_bboxes_adjusted]) if self.face_bboxes is not None else torch.stack([torch.tensor([-1, -1, -1, -1]) for _ in range(self.num_images)])
-            frames, Ks, rel_bbox, face_bboxes_adjusted = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=face_params)
+            frames, Ks, rel_bbox, face_bboxes_result = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=face_params)
+            if face_bboxes_result is not None:
+                face_bboxes_adjusted = face_bboxes_result
             # NOTE: rel_bbox is the delta from the deterministic crop to the random crop
             # this would then be all 0 if not using random_crop
             # for ic-light, we would later need to scale these by the scale factor (1024->576)
@@ -786,9 +881,14 @@ class MVHumanNetDataset(Dataset):
                 "c2w": c2ws,
                 "K": Ks,
                 "use_inconsistent": self.use_inconsistent,
-                "face_bbox": face_bboxes_adjusted  # Face bounding boxes [T, 4] in pixel coords (x1, y1, x2, y2)
+                "face_bbox": face_bboxes_adjusted,  # Face bounding boxes [T, 4] in pixel coords (x1, y1, x2, y2)
                 # NOTE: face_bbox is w.r.t post-cropping, resized 576^2 image!
             }
+            
+            # Add ArcFace embeddings if available
+            if self.arcface_embeddings is not None:
+                output_dict["arcface_embedding"] = arcface_embeddings  # [T, 512]
+                # where None values are replaced with zero tensor
         except Exception as e:
             print(f"Error creating output_dict: {e}")
             raise
@@ -824,6 +924,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
         iclight_dataset_path: str = None,
         infu_dataset_path: str = None,
         face_bbox_dir: str = None,
+        arcface_embeddings_dir: str = None,
         random_crop: bool = False,
         maximal_crop: bool = True,
         val_include: list = None,
@@ -848,6 +949,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
         self.iclight_dataset_path = iclight_dataset_path
         self.infu_dataset_path = infu_dataset_path
         self.face_bbox_dir = face_bbox_dir
+        self.arcface_embeddings_dir = arcface_embeddings_dir
         self.random_crop = random_crop
         self.maximal_crop = maximal_crop
         self.val_include = val_include
@@ -898,6 +1000,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 iclight_dataset_path=self.iclight_dataset_path,
                 infu_dataset_path=self.infu_dataset_path,
                 face_bbox_dir=self.face_bbox_dir,
+                arcface_embeddings_dir=self.arcface_embeddings_dir,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
@@ -921,6 +1024,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 iclight_dataset_path=self.iclight_dataset_path,
                 infu_dataset_path=self.infu_dataset_path,
                 face_bbox_dir=self.face_bbox_dir,
+                arcface_embeddings_dir=self.arcface_embeddings_dir,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
@@ -942,6 +1046,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 iclight_dataset_path=self.iclight_dataset_path,
                 infu_dataset_path=self.infu_dataset_path,
                 face_bbox_dir=self.face_bbox_dir,
+                arcface_embeddings_dir=self.arcface_embeddings_dir,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
@@ -962,8 +1067,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=True,
             pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2
+            persistent_workers=True if self.num_workers > 0 else False,
+            prefetch_factor=2 if self.num_workers > 0 else None
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -979,8 +1084,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=True,
             pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2
+            persistent_workers=True if self.num_workers > 0 else False,
+            prefetch_factor=2 if self.num_workers > 0 else None
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -991,6 +1096,6 @@ class MVHumanNetLoader(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=True,
             pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2
+            persistent_workers=True if self.num_workers > 0 else False,
+            prefetch_factor=2 if self.num_workers > 0 else None
         )
