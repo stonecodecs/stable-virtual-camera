@@ -1186,3 +1186,32 @@ class SevaFrozenOpenCLIPImageEmbedder(AbstractEmbModel):
 
     def encode(self, text):
         return self(text)
+
+
+class ArcFaceProjector(nn.Module):
+    """
+    Projects the 512-dim ArcFace embeddings to a new dimension (e.g., 1024)
+    and applies Layer Normalization. This is intended to be used as an embedder
+    within the GeneralConditioner. (Follows design from IP-Adapter)
+    """
+    def __init__(
+        self,
+        input_dim: int = 512,   # ArcFace
+        cross_attn_dim: int = 1024, # CLIP cross attention dim
+        n_tokens: int = 4,      # sequence length
+        is_trainable: bool = True,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.cross_attn_dim = cross_attn_dim
+        self.n_tokens = n_tokens
+        self.is_trainable = is_trainable
+        
+        self.proj = nn.Linear(input_dim, cross_attn_dim * n_tokens)
+        self.norm = nn.LayerNorm(cross_attn_dim)
+
+        if not self.is_trainable:
+            self.proj.eval().requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.proj(x).reshape(-1, self.n_tokens, self.cross_attn_dim))

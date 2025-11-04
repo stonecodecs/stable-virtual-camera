@@ -93,6 +93,14 @@ class SevaLoRAWrapper(nn.Module):
                         dropout=dropout,
                         keys_to_lora=keys_to_lora,
                     )
+                if hasattr(child, "attn_face"): # New IP-Adapter face cross-attention
+                    child.attn_face = LoRAAttentionWrapper(
+                        original_attn=child.attn_face,
+                        rank=cross_attn_rank, # Re-use cross-attn rank and alpha
+                        alpha=alpha_cross,
+                        dropout=dropout,
+                        keys_to_lora=keys_to_lora,
+                    )
                 # Wrap MLPs in transformer blocks
                 if hasattr(child, "ff") and isinstance(getattr(child, "ff"), nn.Module):
                     try:

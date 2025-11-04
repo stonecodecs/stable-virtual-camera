@@ -37,6 +37,8 @@ class SevaParams(object):
         default_factory=lambda: ["middle_ds8", "output_ds4", "output_ds2"]
     )
     ckpt_path: str | None = None
+    use_ip_adapter: bool = False
+    face_context_dim: int = 512
 
     def __post_init__(self):
         assert len(self.channel_mult) == len(self.transformer_depth)
@@ -92,6 +94,8 @@ class Seva(nn.Module):
                             depth=params.transformer_depth[level],
                             context_dim=params.context_dim,
                             unflatten_names=params.unflatten_names,
+                            use_ip_adapter=params.use_ip_adapter,
+                            face_context_dim=params.face_context_dim,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*input_layers))
@@ -126,6 +130,8 @@ class Seva(nn.Module):
                 depth=params.transformer_depth[-1],
                 context_dim=params.context_dim,
                 unflatten_names=params.unflatten_names,
+                use_ip_adapter=params.use_ip_adapter,
+                face_context_dim=params.face_context_dim,
             ),
             ResBlock(
                 channels=ch,
@@ -164,6 +170,8 @@ class Seva(nn.Module):
                             depth=params.transformer_depth[level],
                             context_dim=params.context_dim,
                             unflatten_names=params.unflatten_names,
+                            use_ip_adapter=params.use_ip_adapter,
+                            face_context_dim=params.face_context_dim,
                         )
                     )
                 if level and i == params.num_res_blocks:
@@ -217,6 +225,7 @@ class Seva(nn.Module):
         y: torch.Tensor,
         dense_y: torch.Tensor,
         num_frames: int | None = None,
+        face_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_frames = num_frames or self.params.num_frames
         t_emb = timestep_embedding(t, self.model_channels)
@@ -231,6 +240,7 @@ class Seva(nn.Module):
                 context=y,
                 dense_emb=dense_y,
                 num_frames=num_frames,
+                face_context=face_context,
             )
             hs.append(h)
         h = self.middle_block(
@@ -239,6 +249,7 @@ class Seva(nn.Module):
             context=y,
             dense_emb=dense_y,
             num_frames=num_frames,
+            face_context=face_context,
         )
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
@@ -248,6 +259,7 @@ class Seva(nn.Module):
                 context=y,
                 dense_emb=dense_y,
                 num_frames=num_frames,
+                face_context=face_context,
             )
         h = h.type(x.dtype)
         return self.out(h) # [B*num_images, C=4, H=72, W=72]
@@ -288,7 +300,7 @@ class SGMWrapper(nn.Module):
     def forward(
         self, x: torch.Tensor, t: torch.Tensor, c: dict, **kwargs
     ) -> torch.Tensor:
-        # c: crossattn, concat, dense_vector
+        # c: crossattn, concat, dense_vector, face_cond
         # kwargs 'num_frames'
         x = torch.cat((x, c.get("concat", torch.Tensor([]).type_as(x))), dim=1)
         # 16,11,72,72 (concat is 7, latent x is 4)
@@ -297,6 +309,7 @@ class SGMWrapper(nn.Module):
             t=t,
             y=c["crossattn"],
             dense_y=c["dense_vector"],
+            face_context=c.get("face_cond"),
             **kwargs,
         )
 
