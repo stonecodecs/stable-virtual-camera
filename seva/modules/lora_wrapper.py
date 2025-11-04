@@ -116,8 +116,8 @@ class SevaLoRAWrapper(nn.Module):
             # Recursively process child modules
             self._wrap_attention_with_lora(child, target_modules, dropout, self_attn_rank, cross_attn_rank, ff_rank, alphas, keys_to_lora, excluded_modules, module_path)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor, dense_y: torch.Tensor, num_frames: Optional[int] = None) -> torch.Tensor:
-        return self.seva_model(x, t, y, dense_y, num_frames)
+    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor, dense_y: torch.Tensor, num_frames: Optional[int] = None, face_context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.seva_model(x, t, y, dense_y, num_frames, face_context)
 
     def save_lora_weights(self, path: str):
         """Save only the LoRA weights."""

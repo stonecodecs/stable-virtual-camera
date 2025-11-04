@@ -67,7 +67,8 @@ class SevaWrapper(IdentityWrapper):
             t=t,
             y=y,
             dense_y=dense_y,
-            num_frames=f
+            num_frames=f,
+            face_context=c.get("face_cond"),
             # **kwargs,
         )
         out = rearrange(out, "(b f) c h w -> b f c h w", f=f)
