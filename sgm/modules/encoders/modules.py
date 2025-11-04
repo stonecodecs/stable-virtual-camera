@@ -31,6 +31,7 @@ class AbstractEmbModel(nn.Module):
         self._is_trainable = None
         self._ucg_rate = None
         self._input_key = None
+        self._output_key = None
 
     @property
     def is_trainable(self) -> bool:
@@ -44,6 +45,10 @@ class AbstractEmbModel(nn.Module):
     def input_key(self) -> str:
         return self._input_key
 
+    @property
+    def output_key(self) -> Optional[str]:
+        return self._output_key
+
     @is_trainable.setter
     def is_trainable(self, value: bool):
         self._is_trainable = value
@@ -55,6 +60,10 @@ class AbstractEmbModel(nn.Module):
     @input_key.setter
     def input_key(self, value: str):
         self._input_key = value
+
+    @output_key.setter
+    def output_key(self, value: str):
+        self._output_key = value
 
     @is_trainable.deleter
     def is_trainable(self):
@@ -68,10 +77,14 @@ class AbstractEmbModel(nn.Module):
     def input_key(self):
         del self._input_key
 
+    @output_key.deleter
+    def output_key(self):
+        del self._output_key
+
 
 class GeneralConditioner(nn.Module):
     OUTPUT_DIM2KEYS = {2: "vector", 3: "crossattn", 4: "concat", 5: "concat"}
-    KEY2CATDIM = {"vector": 1, "crossattn": 2, "concat": 1, "cond_view": 1, "cond_motion": 1}
+    KEY2CATDIM = {"vector": 1, "crossattn": 2, "concat": 1, "cond_view": 1, "cond_motion": 1, "face_cond": 2}
 
     def __init__(self, emb_models: Union[List, ListConfig]):
         super().__init__()
@@ -101,6 +114,9 @@ class GeneralConditioner(nn.Module):
                 raise KeyError(
                     f"need either 'input_key' or 'input_keys' for embedder {embedder.__class__.__name__}"
                 )
+
+            if "output_key" in embconfig:
+                embedder.output_key = embconfig["output_key"]
 
             embedder.legacy_ucg_val = embconfig.get("legacy_ucg_value", None)
             if embedder.legacy_ucg_val is not None:
@@ -139,7 +155,9 @@ class GeneralConditioner(nn.Module):
             if not isinstance(emb_out, (list, tuple)):
                 emb_out = [emb_out]
             for emb in emb_out:
-                if embedder.input_key in ["cond_view", "cond_motion", "plucker", "mask", "replace"]:
+                if hasattr(embedder, "output_key") and embedder.output_key is not None:
+                    out_key = embedder.output_key
+                elif embedder.input_key in ["cond_view", "cond_motion", "plucker", "mask", "replace"]:
                     out_key = embedder.input_key
                 else:
                     out_key = self.OUTPUT_DIM2KEYS[emb.dim()]
@@ -1188,7 +1206,7 @@ class SevaFrozenOpenCLIPImageEmbedder(AbstractEmbModel):
         return self(text)
 
 
-class ArcFaceProjector(nn.Module):
+class ArcFaceProjector(AbstractEmbModel):
     """
     Projects the 512-dim ArcFace embeddings to a new dimension (e.g., 1024)
     and applies Layer Normalization. This is intended to be used as an embedder

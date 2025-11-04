@@ -97,7 +97,8 @@ model:
           target: sgm.modules.encoders.modules.ArcFaceProjector
           params:
             input_dim: 512
-            output_dim: 1024
+            cross_attn_dim: 1024
+            n_tokens: 4
 
     first_stage_config:
       target: sgm.modules.encoders.modules.SevaAutoencoder
