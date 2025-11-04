@@ -42,6 +42,7 @@ import time
 from seva.data.cropper import RandomBBoxCropper
 from seva.modules.autoencoder import AutoEncoder
 import torchvision
+import h5py
 
 # NOTE: hardcoded camera order for each camera elevation (counter clockwise)
 # use for trajectory NVS training!
@@ -98,6 +99,32 @@ def scale_cameras(c2ws, camera_scale=2.0):
         else (camera_scale / torch.norm(camera_dists[0]))
     )
     c2ws[:, :3, 3] *= translation_scaling_factor
+
+
+def read_from_hdf5(hdf5_file, *args):
+    # each arg will be nested keys
+    try:
+        with h5py.File(hdf5_file, 'r') as f:
+            # Navigate through nested keys
+            current = f
+            for arg in args:
+                current = current[arg]
+            
+            # Read the data into memory before closing the file
+            if isinstance(current, h5py.Dataset):
+                # For datasets, read the actual data
+                return np.array(current)
+            elif isinstance(current, h5py.Group):
+                # For groups, return a dict of the group structure
+                return {key: current[key] for key in current.keys()}
+            else:
+                return current
+    except KeyError:
+        return None
+    except Exception as e:
+        print(f"Error reading HDF5 file: {e}")
+        return None
+
 
 class MVHumanNetDataset(Dataset):
     def __init__(
@@ -187,8 +214,7 @@ class MVHumanNetDataset(Dataset):
         self.crop_padding = crop_padding
         # actual data
         self.cam_params = {} # Dict[subject: (extrinsics, intrinsics, camera_scale)]
-        self.face_bboxes = self._load_face_bboxes() if face_bbox_dir is not None else None # * needs to be loaded BEFORE scenes!
-        self.arcface_embeddings = self._load_arcface_embeddings() if arcface_embeddings_dir is not None else None
+        self.face_bboxes = self._load_face_bboxes() if face_bbox_dir is not None else None # * needs to be loaded BEFORE scenes
         self.scenes = self._load_scenes() if preload_path is None else self._load_preloaded_filepaths()
         self.image_shape = (1500, 2048) # MVHumanNet images are 2048x1500
 
@@ -255,34 +281,12 @@ class MVHumanNetDataset(Dataset):
 
         return all_face_info
 
-    def _load_arcface_embeddings(self):
+    def _read_arcface_embeddings(self, *args):
         """
-        Loads ArcFace embeddings analogously to face bboxes.
+        Reads from chosen HDF5 file
         """
-        all_arcface_info = {"gt": {}}
-        subdirs = []
-        for arcface_json in os.listdir(self.arcface_embeddings_dir):
-            if arcface_json.endswith(".json"):
-                all_arcface_info["gt"].update(load_json(os.path.join(self.arcface_embeddings_dir, arcface_json)))
-            elif os.path.isdir(os.path.join(self.arcface_embeddings_dir, arcface_json)):
-                subdirs.append(arcface_json)
-
-        for subdir in subdirs: # these would be 'relit_images' or 'inconsistent_images'
-            # HACK (but just change the names later)
-            if subdir == "relit_images":     
-                subdir_name = "iclight"
-            elif subdir == "inconsistent_images":
-                subdir_name = "infu"
-            elif subdir == "gt":
-                raise ValueError(f"ArcFace embeddings folder should NOT have a 'gt' subdirectory!")
-            else:
-                raise ValueError(f"Unknown subdirectory: {subdir}")
-            all_arcface_info[subdir_name] = {}
-            for sub_json in os.listdir(os.path.join(self.arcface_embeddings_dir, subdir)):
-                if sub_json.endswith(".json"):
-                    all_arcface_info[subdir_name].update(load_json(os.path.join(self.arcface_embeddings_dir, subdir, sub_json)))
-
-        return all_arcface_info
+        # * UPDATE: lazy load from HDF5
+        return read_from_hdf5(os.path.join(self.arcface_embeddings_dir, "arcface_embeddings_merged.hdf5"), *args)
 
     def _load_preloaded_filepaths(self):
         """
@@ -384,29 +388,14 @@ class MVHumanNetDataset(Dataset):
                                 print(f"Skipping subject {subject} camera {camera} timestep {timestep} because bbox is invalid")
                                 continue
 
-                        if self.arcface_embeddings is not None:
-                            try:
-                                arcface_embedding = self.arcface_embeddings["gt"][subject][camera][f"{time_id}_img.jpg"]
-                            except KeyError:
-                                arcface_embedding = None
-
                         subject_map[time_id][camera] = {
                                     'image_path': image_path,
                                     'mask_path': mask_path,
                                     'annots': {
                                         'bbox': bbox,
                                         'bbox_face': face_bbox if self.face_bboxes is not None else None,
-                                        'arcface_embedding': arcface_embedding if self.arcface_embeddings is not None else None
                                     }
                                 }
-                        if self.arcface_embeddings is not None:
-                            try:
-                                subject_map[time_id][camera]['annots']['arcface_embedding_iclight'] = self.arcface_embeddings["iclight"][subject][camera][f"{time_id}_img.png"]
-                            except KeyError:
-                                try:
-                                    subject_map[time_id][camera]['annots']['arcface_embedding_infu'] = self.arcface_embeddings["infu"][subject][camera][f"{time_id}_img.png"]
-                                except KeyError:
-                                    pass
                 except Exception as e: # NOTE: this is a hack to ignore missing timesteps
                     print(f"Error loading subject {subject} camera {camera} timestep {timestep}: {e}")
                     subject_map.pop(time_id, None) # remove this timestep from the subject_map
@@ -665,26 +654,31 @@ class MVHumanNetDataset(Dataset):
             ic_rgb = torch.zeros((self.num_images, 3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
 
         arcface_embeddings = []
-        if self.arcface_embeddings is not None:
+        if self.arcface_embeddings_dir is not None:
             if ic_mask is not None: # if using InfU + IC-light
-                for is_infu, cam in zip(ic_mask, camera_order):
-                    # TODO: get InfU and IC-light embeddings separately
-                    # For now, use ground truth embedding
+                for i, (is_infu, cam) in enumerate(zip(ic_mask, camera_order)):
                     try:
-                        arcface_embedding = frames_info[cam]['annots']['arcface_embedding']
+                        if is_infu: # not implemented yet
+                            arcface_embedding = self._read_arcface_embeddings("infu", subject_id, cam, f"{timestep}_img.png")
+                        elif self.ref_mask[i]:
+                            arcface_embedding = self._read_arcface_embeddings("mvhn", subject_id, cam, f"{timestep}_img.jpg")
+                        else:
+                            arcface_embedding = self._read_arcface_embeddings("iclight", subject_id, cam, f"{timestep}_img.png")
                     except KeyError:
+                        arcface_embedding = None
+                    except Exception as e:
+                        print(f"Error reading arcface embedding: {e}")
                         arcface_embedding = None
                     arcface_embeddings.append(arcface_embedding)
             else: # if only using IC-light or no ic
                 for is_ref, cam in zip(self.ref_mask, camera_order):
                     # For reference frames, use GT embedding
                     # For target frames, also use GT for training
-                    # TODO: For IC-light conditioned frames, load IC-light embeddings
                     try:
                         if is_ref:
-                            arcface_embedding = frames_info[cam]['annots']['arcface_embedding']
+                            arcface_embedding = self._read_arcface_embeddings("mvhn", subject_id, cam, f"{timestep}_img.jpg")
                         else:
-                            arcface_embedding = frames_info[cam]['annots']['arcface_embedding_iclight']
+                            arcface_embedding = self._read_arcface_embeddings("iclight", subject_id, cam, f"{timestep}_img.png")
                     except KeyError:
                         arcface_embedding = None
                     arcface_embeddings.append(arcface_embedding)
@@ -886,7 +880,7 @@ class MVHumanNetDataset(Dataset):
             }
             
             # Add ArcFace embeddings if available
-            if self.arcface_embeddings is not None:
+            if self.arcface_embeddings_dir is not None:
                 output_dict["arcface_embedding"] = arcface_embeddings  # [T, 512]
                 # where None values are replaced with zero tensor
         except Exception as e:
