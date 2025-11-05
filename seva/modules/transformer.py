@@ -70,6 +70,7 @@ class Attention(nn.Module):
             lambda t: rearrange(t, "b l (h d) -> b h l d", h=self.heads).contiguous(),
             (q, k, v),
         )
+
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             out = F.scaled_dot_product_attention(q, k, v).contiguous()
         
@@ -162,6 +163,10 @@ class IPAdapterTransformerBlock(nn.Module):
         clip_attn_output = self.attn2(self.norm2(self_attn_out), context=context)
         
         if face_context is not None:
+            # The attention layer expects a 3D tensor: [batch, seq_len, features]
+            # Reshape context to combine frames and tokens for the attention mechanism
+            if face_context.ndim == 4:
+                face_context = rearrange(face_context, "b f n d -> b (f n) d")
             face_attn_output = self.attn_face(self.norm_face(self_attn_out), context=face_context)
             x = self_attn_out + clip_attn_output + face_attn_output
         else:
@@ -298,6 +303,8 @@ class MultiviewTransformer(nn.Module):
 
         if self.name in self.unflatten_names:
             context = context[::num_frames]
+            if face_context is not None:
+                face_context = rearrange(face_context, "(b t) ... -> b t ...", t=num_frames)
 
         x = self.norm(x)
         x = rearrange(x, "b c h w -> b (h w) c").contiguous()
