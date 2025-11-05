@@ -153,6 +153,8 @@ class IPAdapterTransformerBlock(nn.Module):
             dim_head=d_head,
             dropout=dropout,
         )
+        nn.init.zeros_(self.attn_face.to_out[0].weight)
+        nn.init.zeros_(self.attn_face.to_out[0].bias)
         self.norm_face = nn.LayerNorm(dim)
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, face_context: torch.Tensor | None = None) -> torch.Tensor:
