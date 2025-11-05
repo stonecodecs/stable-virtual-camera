@@ -904,6 +904,10 @@ class ImageLogger(Callback):
 
                 uc["plucker"] = c["plucker"] # camera embeds are the same (test time)
 
+                if "face_cond" in uc and uc["face_cond"].ndim == 3:
+                    c["face_cond"] = c["face_cond"].repeat(x.shape[0], 1, 1, 1)
+                    uc["face_cond"] = uc["face_cond"].repeat(x.shape[0], 1, 1, 1)
+
                 sampling_kwargs = {}
                 if isinstance(pl_module.sampler.guider, MultiviewCFG):
                     sampling_kwargs["c2w"] = batch.get("c2w", None)
@@ -921,6 +925,8 @@ class ImageLogger(Callback):
                 # sample latents for targets
                 if sample:
                     # with pl_module.ema_scope("Plotting"): 
+                    c["face_cond"] = repeat(c["face_cond"], "b f c d -> (b f) c d", f=z.shape[1])
+                    uc["face_cond"] = repeat(uc["face_cond"], "b f c d -> (b f) c d", f=z.shape[1])
                     samples = pl_module.sample(
                         c, shape=z.shape[1:], uc=uc, batch_size=N, **sampling_kwargs
                     )
@@ -1395,7 +1401,7 @@ if __name__ == "__main__":
             strategy_cfg = OmegaConf.create()
             default_strategy_config["params"] = {
                 "find_unused_parameters": False,
-                "timeout": 7200,  # 2 hours timeout in seconds (will be converted to timedelta)
+                "timeout": 3600,  # 1 hours timeout in seconds (will be converted to timedelta)
                 # "static_graph": True,
                 # "ddp_comm_hook": default.fp16_compress_hook  # TODO: experiment with this, also for DDPSharded
             }

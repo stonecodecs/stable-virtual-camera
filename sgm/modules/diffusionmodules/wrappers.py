@@ -62,6 +62,7 @@ class SevaWrapper(IdentityWrapper):
         t = repeat(t, "b -> (b f)", f=f)
         y = repeat(c["crossattn"], "b 1 c -> (b f) 1 c", f=f)
         if "face_cond" in c:
+            # face_context = repeat(c["face_cond"], "b f c d -> (b f) c d", f=f)
             face_context = c["face_cond"]
         else:
             face_context = None
