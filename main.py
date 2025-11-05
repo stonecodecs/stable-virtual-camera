@@ -848,7 +848,41 @@ class ImageLogger(Callback):
 
             # NEW -- CPU based logging, based on DiffusionEngine.log_images
             # ! replaced with old GPU logging
-            with torch.no_grad():
+            with torch.no_grad(), torch.amp.autocast("cuda"):
+                x = pl_module.get_input(batch)
+                if len(x.shape) == 1: # if latents are NOT computed yet, encode
+                    x = batch["frames"].to(pl_module.device)
+                    batch_latents = []
+                    for b in x:
+                        batch_latents.append(pl_module.encode_first_stage(b)) # scales automatically
+                    x = torch.stack(batch_latents, dim=0)
+                    batch["clean_latent"] = x
+                else: #latents already precomputed (same as "IdentityEncoder")
+                    batch["clean_latent"] = x * pl_module.scale_factor # need to scale!
+
+                # encode ic latents from the paths (scales)
+                if torch.any(batch["use_inconsistent"]).item():
+                    ic = pl_module._encode_inconsistent_images(batch["ic_rgb"], batch["ref_mask"], batch["clean_latent"])
+                    # for target (not input/ref) frames, zero condition latents
+                    ic[~batch["mask"]] = 0
+                else:
+                    # no conditioning (to be replaced by clean_latents for inputs)
+                    ic = torch.zeros_like(batch["clean_latent"], device=pl_module.device)
+                    ic[batch["ref_mask"]] = batch["clean_latent"][batch["ref_mask"]]
+                
+                batch.update({
+                    "replace": torch.cat([
+                        batch["clean_latent"],
+                        repeat(
+                            batch["ref_mask"],
+                            "b n -> b n 1 h w",
+                            h=batch["plucker"].shape[-2],
+                            w=batch["plucker"].shape[-1]
+                        )
+                    ], dim=2),
+                    "concat": torch.cat([batch["concat"], ic], dim=2)
+                })
+
                 conditioner_input_keys = [e.input_key for e in pl_module.conditioner.embedders]
                 if self.log_images_kwargs.get("ucg_keys"):
                     ucg_keys = self.log_images_kwargs.get("ucg_keys")
@@ -860,41 +894,6 @@ class ImageLogger(Callback):
                     ucg_keys = conditioner_input_keys
 
                 log = dict()
-                x = pl_module.get_input(batch) # clean_latent
-                if len(x.shape) == 1: # if latents are NOT computed yet, encode
-                    x = batch["frames"].to(pl_module.device)
-                    batch_latents = []
-                    for b in x:
-                        batch_latents.append(pl_module.encode_first_stage(b)) # scales automatically
-                    x = torch.stack(batch_latents, dim=0)
-                else: 
-                    x = x * pl_module.scale_factor
-                batch["clean_latent"] = x
-
-                if torch.any(batch["use_inconsistent"]).item():
-                    ic = pl_module._encode_inconsistent_images(batch["ic_rgb"], batch["ref_mask"], batch["clean_latent"])
-                    # for target (not input/ref) frames, zero condition latents
-                    ic[~batch["mask"]] = 0
-                    rgb_ic = batch["ic_rgb"]
-                else:
-                    # no conditioning (to be replaced by clean_latents for inputs)
-                    ic = torch.zeros_like(batch["clean_latent"], device=pl_module.device)
-                    ic[batch["ref_mask"]] = batch["clean_latent"][batch["ref_mask"]]
-                    rgb_ic = batch["frames"] # same thing as GTs in phase 1
-
-                # update the batch using this
-                batch.update({
-                    "replace": torch.cat([
-                        batch["clean_latent"],
-                        repeat(
-                            batch["ref_mask"],
-                            "b n -> b n 1 h w",
-                            h=batch["concat"].shape[-2],
-                            w=batch["concat"].shape[-1]
-                        )
-                    ], dim=2),
-                    "concat": torch.cat([batch["concat"], ic], dim=2)
-                }) # concat to be (B, T, 6(plucker) + 2(masks) + 4(ic))
 
                 c, uc = pl_module.conditioner.get_unconditional_conditioning(
                     batch,
@@ -928,9 +927,7 @@ class ImageLogger(Callback):
 
                 # log to wandb stage
                 gt_images = batch["frames"][:N].to("cpu") # choose first N from B
-                rgb_ic = rgb_ic[:N].to("cpu")
                 ref_mask = batch["ref_mask"][:N].to("cpu") # put into CPU (when using CPU, otherwise GPU)
-                gt_images[~ref_mask] = rgb_ic[~ref_mask]
 
                 pre_images = {} # legacy name
                 pre_images["inputs"] = gt_images

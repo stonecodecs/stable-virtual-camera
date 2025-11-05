@@ -73,8 +73,6 @@ class Attention(nn.Module):
 
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             out = F.scaled_dot_product_attention(q, k, v).contiguous()
-        
-        # Convert back to original dtype
         out = rearrange(out, "b h l d -> b l (h d)").contiguous()
         out = self.to_out(out)
         return out
