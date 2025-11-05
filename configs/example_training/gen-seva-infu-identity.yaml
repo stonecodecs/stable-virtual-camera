@@ -115,9 +115,7 @@ model:
             num_idx: 1000
             discretization_config:
               target: sgm.modules.diffusionmodules.discretizer.SevaDDPMDiscretization
-        use_face_perceptual: true
-        face_perceptual_weight: 1.0
-        face_weighting: 3.0
+        face_weighting: 0.5
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler
       params:
@@ -133,7 +131,7 @@ data:
   target: seva.data.mvh_dataloader.MVHumanNetLoader
   params:
     root_dir: /workspace/datasetvol/mvhuman_data/mv_captures
-    batch_size: 1
+    batch_size: 2
     num_workers: 4
     num_images: 8
     step_size: 60
@@ -142,7 +140,7 @@ data:
     preload_path: /workspace/datasetvol/mvhuman_data/mv_captures/preloaded_filepaths1.json
     iclight_dataset_path: /workspace/datasetvol/mvhuman_data/relit_images
     infu_dataset_path: /workspace/datasetvol/mvhuman_data/inconsistent_images
-    face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
+    # face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
     arcface_embeddings_dir: /workspace/datasetvol/mvhuman_data/arcface_embeddings # New path for arcface embeddings
     maximal_crop: true
     random_crop: true

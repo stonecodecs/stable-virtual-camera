@@ -124,9 +124,7 @@ model:
             num_idx: 1000
             discretization_config:
               target: sgm.modules.diffusionmodules.discretizer.SevaDDPMDiscretization
-        use_face_perceptual: true
-        face_perceptual_weight: 1.0
-        face_weighting: 3.0
+        face_weighting: 0.5
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler
       params:

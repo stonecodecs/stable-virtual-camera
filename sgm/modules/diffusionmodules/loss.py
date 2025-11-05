@@ -56,9 +56,6 @@ class StandardDiffusionLoss(nn.Module):
         loss_type: str = "l2",
         offset_noise_level: float = 0.0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
-        use_face_perceptual: bool = False, # ! - computationally intractable, legacy
-        face_perceptual_weight: float = 0.3,
-        face_crop_size: int = 128,
         face_weighting: float = 0.0,
     ):
         super().__init__()
@@ -70,14 +67,8 @@ class StandardDiffusionLoss(nn.Module):
 
         self.loss_type = loss_type
         self.offset_noise_level = offset_noise_level
-        self.use_face_perceptual = use_face_perceptual
-        self.face_perceptual_weight = face_perceptual_weight
-        self.face_crop_size = face_crop_size
         self.face_weighting = face_weighting # how much to weigh the face over the rest
         # 0.0 -> no extra face weighting, spatially uniform loss weighting
-        # NOTE: this is different from using face_perceptual_weight
-        # as this creates a "weighting mask" in the latent space
-        # and applies to regular L2 loss.
         
         # Store reference to first_stage_model for RGB decoding (set externally)
         self.first_stage_model = None
@@ -86,13 +77,6 @@ class StandardDiffusionLoss(nn.Module):
         if loss_type == "lpips":
             self.lpips = LPIPS().eval()
         
-        # Initialize LPIPS for face perceptual loss if needed
-        if self.use_face_perceptual:
-            if not hasattr(self, 'lpips'):
-                self.lpips = LPIPS().eval()
-            for param in self.lpips.parameters():
-                param.requires_grad = False
-
         if not batch2model_keys:
             batch2model_keys = []
 
@@ -157,22 +141,9 @@ class StandardDiffusionLoss(nn.Module):
         else:
             w = append_dims(self.loss_weighting(sigmas), input.ndim)
         # Compute base loss
-        base_loss = self.get_loss(model_output, input, w, face_bbox=batch.get("face_bbox"), ref_mask=batch.get("ref_mask"), enable_face_weighting=self.face_weighting > 0.0)
+        loss = self.get_loss(model_output, input, w, face_bbox=batch.get("face_bbox"), ref_mask=batch.get("ref_mask"), enable_face_weighting=self.face_weighting > 0.0)
         
-        # Add face perceptual loss if enabled
-        if self.use_face_perceptual and "face_bbox" in batch:
-            # input is "clean_latent"
-            # in face loss, we work in RGB space, so we use batch["frames"]
-            # for LPIPS comparisons over the face
-            try: 
-                face_loss = self.get_face_crop_perceptual_loss(model_output, input, batch)
-            except Exception as e: # for any error, just continue with no face loss
-                print(f"Error in face perceptual loss: {e}")
-                face_loss = torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
-            total_loss = base_loss + self.face_perceptual_weight * face_loss
-            return total_loss
-        
-        return base_loss
+        return loss
 
     def get_face_weighting_loss(self, face_bbox, spatial_loss, ref_mask):
         """
@@ -261,6 +232,8 @@ class StandardDiffusionLoss(nn.Module):
         else:
             raise NotImplementedError(f"Unknown loss type {self.loss_type}")
 
+
+    # ! DEPRECATED!
     def get_face_crop_perceptual_loss(
         self,
         model_output: torch.Tensor,  # Predicted latents [B, T, C, H, W]

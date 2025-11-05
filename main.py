@@ -925,8 +925,6 @@ class ImageLogger(Callback):
                 # sample latents for targets
                 if sample:
                     # with pl_module.ema_scope("Plotting"): 
-                    c["face_cond"] = repeat(c["face_cond"], "b f c d -> (b f) c d", f=z.shape[1])
-                    uc["face_cond"] = repeat(uc["face_cond"], "b f c d -> (b f) c d", f=z.shape[1])
                     samples = pl_module.sample(
                         c, shape=z.shape[1:], uc=uc, batch_size=N, **sampling_kwargs
                     )

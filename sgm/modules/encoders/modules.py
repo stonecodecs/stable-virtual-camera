@@ -1232,4 +1232,5 @@ class ArcFaceProjector(AbstractEmbModel):
             self.proj.eval().requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.proj(x).reshape(-1, self.n_tokens, self.cross_attn_dim))
+        B = x.shape[0]
+        return self.norm(self.proj(x).reshape(B, -1, self.n_tokens, self.cross_attn_dim))
