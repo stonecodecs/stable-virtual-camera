@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import repeat
 
 from ...modules.autoencoding.lpips.loss.lpips import LPIPS
 from ...modules.encoders.modules import GeneralConditioner
@@ -57,6 +58,8 @@ class StandardDiffusionLoss(nn.Module):
         offset_noise_level: float = 0.0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
         face_weighting: float = 0.0,
+        arcface_loss_weight: float = 0.0,
+        arcface_gt_key: str = "arcface_embedding",
     ):
         super().__init__()
 
@@ -67,9 +70,11 @@ class StandardDiffusionLoss(nn.Module):
 
         self.loss_type = loss_type
         self.offset_noise_level = offset_noise_level
-        self.face_weighting = face_weighting # how much to weigh the face over the rest
+        self.face_weighting = face_weighting  # how much to weigh the face over the rest
         # 0.0 -> no extra face weighting, spatially uniform loss weighting
-        
+        self.arcface_loss_weight = arcface_loss_weight
+        self.arcface_gt_key = arcface_gt_key
+
         # Store reference to first_stage_model for RGB decoding (set externally)
         self.first_stage_model = None
         self.scale_factor = None
@@ -141,9 +146,59 @@ class StandardDiffusionLoss(nn.Module):
         else:
             w = append_dims(self.loss_weighting(sigmas), input.ndim)
         # Compute base loss
-        loss = self.get_loss(model_output, input, w, face_bbox=batch.get("face_bbox"), ref_mask=batch.get("ref_mask"), enable_face_weighting=self.face_weighting > 0.0)
-        
+        loss = self.get_loss(
+            model_output,
+            input,
+            w,
+            face_bbox=batch.get("face_bbox"),
+            ref_mask=batch.get("ref_mask"),
+            enable_face_weighting=self.face_weighting > 0.0,
+        )
+
+        # Add auxiliary ArcFace identity loss if enabled
+        if self.training and self.arcface_loss_weight > 0.0:
+            arcface_loss = self.get_arcface_loss(network, batch)
+            loss = loss + self.arcface_loss_weight * arcface_loss
+
         return loss
+
+    def get_arcface_loss(self, network: nn.Module, batch: Dict) -> torch.Tensor:
+        """
+        Computes the cosine similarity loss between predicted and ground-truth ArcFace embeddings.
+        """
+        # The path to the Seva model might vary depending on wrappers
+        if hasattr(network, "diffusion_model") and hasattr(
+            network.diffusion_model, "seva_model"
+        ):
+            predicted_embed = (
+                network.diffusion_model.seva_model.predicted_arcface_embedding
+            )
+        else:
+            predicted_embed = network.predicted_arcface_embedding
+
+        if predicted_embed is None:
+            return torch.tensor(0.0, device=network.device)
+
+        gt_embed = batch.get(self.arcface_gt_key)
+        if gt_embed is None:
+            return torch.tensor(0.0, device=network.device)
+
+        # The dataloader may yield GT embeddings with shape [B, 1, 512]
+        if gt_embed.ndim == 3:
+            gt_embed = gt_embed.squeeze(1)
+
+        # Predicted embeddings are [B*F, 512], GT embeddings from batch are likely [B, 512] or [B,F,512]
+        # We need to match them.
+        if predicted_embed.shape[0] != gt_embed.shape[0]:
+            num_frames = predicted_embed.shape[0] // gt_embed.shape[0]
+            gt_embed = repeat(gt_embed, "b ... -> (b f) ...", f=num_frames)
+
+        # Normalize both embeddings before comparing
+        predicted_embed = F.normalize(predicted_embed, p=2, dim=1)
+        gt_embed = F.normalize(gt_embed.to(predicted_embed.device), p=2, dim=1)
+
+        loss = 1.0 - F.cosine_similarity(predicted_embed, gt_embed, dim=1)
+        return loss.mean()
 
     def get_face_weighting_loss(self, face_bbox, spatial_loss, ref_mask):
         """
