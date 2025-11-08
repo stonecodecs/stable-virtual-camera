@@ -207,7 +207,9 @@ class MVHumanNetDataset(Dataset):
                     continue
                 if self.only_include is not None and subject_id not in self.only_include:
                     continue
-                self.infu_num_images[subject_id] = len(os.listdir(os.path.join(self.infu_dataset_path, subject_id)))
+                self.infu_num_images[subject_id] = len(os.listdir(os.path.join(self.infu_dataset_path, subject_id))) - 2
+                # HACK: -2 because there are 2 extra files in the directory that aren't images (depth/seg npz files)
+                # this can be cleaner (TODO), but would require more system I/O to handle, which may not be worth it
 
         if self.num_images > 16: # if more than 16, disable trajectory NVS batching
             self.adjacent_frame_sampling_prob = 0.0
