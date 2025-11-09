@@ -1335,7 +1335,7 @@ if __name__ == "__main__":
             try:
                 print(f"Attempting weights-only load from checkpoint '{ckpt_resume_path}' "
                     "(optimizer/scheduler WILL NOT be restored).")
-                ckpt = torch.load(ckpt_resume_path, map_location="cpu")
+                ckpt = torch.load(ckpt_resume_path, map_location="cpu", weights_only=False)
 
                 # Lightning checkpoints usually store the model under "state_dict"
                 if isinstance(ckpt, dict) and "state_dict" in ckpt:

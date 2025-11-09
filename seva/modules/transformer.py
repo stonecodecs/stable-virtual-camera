@@ -155,18 +155,18 @@ class IPAdapterTransformerBlock(nn.Module):
         )
         nn.init.zeros_(self.attn_face.to_out[0].weight)
         nn.init.zeros_(self.attn_face.to_out[0].bias)
-        self.norm_face = nn.LayerNorm(dim)
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, face_context: torch.Tensor | None = None) -> torch.Tensor:
         x = self.attn1(self.norm1(x)) + x
-        clip_attn_output = self.attn2(self.norm2(x), context=context)
+        x_norm = self.norm2(x)
+        clip_attn_output = self.attn2(x_norm, context=context)
         
         if face_context is not None:
             # The attention layer expects a 3D tensor: [batch, seq_len, features]
             # Reshape context to combine frames and tokens for the attention mechanism
             if face_context.ndim == 4:
                 face_context = rearrange(face_context, "b f n d -> b (f n) d")
-            face_attn_output = self.attn_face(self.norm_face(x), context=face_context)
+            face_attn_output = self.attn_face(x_norm, context=face_context)
             x = clip_attn_output + face_attn_output + x
         else:
             x = clip_attn_output + x

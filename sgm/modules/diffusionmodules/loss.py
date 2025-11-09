@@ -213,7 +213,7 @@ class StandardDiffusionLoss(nn.Module):
         gt_embed_norm = F.normalize(gt_embed, p=2, dim=1)
 
         loss = 1.0 - F.cosine_similarity(predicted_embed_norm, gt_embed_norm, dim=1)
-        loss_mean = loss.mean()
+        loss_mean = loss.mean(dim=1)
 
         del predicted_embed_norm, gt_embed_norm, loss
         return loss_mean
