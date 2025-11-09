@@ -14,6 +14,7 @@ def skip_module_if_excluded(module_path: str, excluded_modules: list[str]) -> bo
             return True
     return False
 
+# In seva/modules/lora_wrapper.py
 
 class SevaLoRAWrapper(nn.Module):
     def __init__(
@@ -22,11 +23,12 @@ class SevaLoRAWrapper(nn.Module):
         self_attn_rank: int = 4,
         cross_attn_rank: int = 8,
         ff_rank: int = 8,
-        alpha: Union[float, List] = 1.0,  # Reduced from 4.0
+        alpha: Union[float, List] = 1.0,
         dropout: float = 0.0,
         target_modules: Optional[list[str]] = None,
         keys_to_lora: list[str] = ["q", "k", "v"],
         excluded_modules: list[str] = [],
+        lora_for_face_attn_only: bool = False,
     ):
         super().__init__()
         self.seva_model: nn.Module = cast(nn.Module, instantiate_from_config(seva_model_config))
@@ -42,80 +44,73 @@ class SevaLoRAWrapper(nn.Module):
         self.dropout = dropout
         self.excluded_modules = excluded_modules
         self.keys_to_lora = keys_to_lora
-        # excluded_modules expects an list/set of module path strings
-        # an example: output_blocks.9.TimestepEmbedSequential.1.MultiviewTransformer.time_mix_blocks.ModuleList.0.TransformerBlockTimeMix.attn1
-        # (excludes the LoRA-transformed MultiviewTransformer's attn1 block in the 9th element of output_blocks)
-        # can exclude an entire block by passing in the block's name (e.g. "output_blocks.9", "input_blocks", etc.)
 
         if isinstance(self.seva_model, Seva):
-            self.seva_model.freeze(["input", "middle", "output"]) # ensure frozen layers
+            # When only training face attention LoRA, freeze everything else.
+            if lora_for_face_attn_only:
+                self.seva_model.requires_grad_(False)
+                print("SevaLoRAWrapper: Froze all parameters in Seva model.")
+            else:
+                self.seva_model.freeze(["input", "middle", "output"])
 
-        if target_modules is None:
-            # only attention-based layers by default plus feed-forward wrappers
-            target_modules = ["TransformerBlockTimeMix", "MultiviewTransformer", "TransformerBlock"]
-
-        # Wrap attention and MLP layers with LoRA
-        self._wrap_attention_with_lora(
-            self.seva_model, 
-            target_modules, 
-            dropout, 
-            self_attn_rank, 
-            cross_attn_rank, 
+        # This single call will recursively find and wrap all qualifying modules.
+        self._apply_lora_to_model(
+            self.seva_model,
+            self_attn_rank,
+            cross_attn_rank,
             ff_rank,
-            self.alpha, 
-            keys_to_lora,
-            excluded_modules
+            self.alpha,
+            dropout,
+            self.keys_to_lora,
+            self.excluded_modules
         )
 
-    def _wrap_attention_with_lora(self, module, target_modules, dropout, self_attn_rank, cross_attn_rank, ff_rank, alphas, keys_to_lora, excluded_modules, current_path=""):
-        """Recursively wrap attention and feed-forward (MLP) modules with LoRA."""
+        if lora_for_face_attn_only:
+            # Unfreeze only the face attention blocks.
+            for name, module in self.seva_model.named_modules():
+                if 'attn_face' in name:
+                    module.requires_grad_(True)
+                    print(f"SevaLoRAWrapper: Unfroze all parameters for {name}")
+
+    def _apply_lora_to_model(self, module, self_attn_rank, cross_attn_rank, ff_rank, alphas, dropout, keys_to_lora, excluded_modules, prefix=""):
+        """
+        Applies LoRA to modules that look like transformer blocks. (Updated from complicated recursive version that would break state_dict)
+        """
         for name, child in module.named_children():
-            module_path = f"{current_path}.{name}.{child.__class__.__name__}" if current_path else name
+            path = f"{prefix}.{name}" if prefix else name
 
-            if skip_module_if_excluded(module_path, excluded_modules):
-                continue
+            # First, recurse to the deepest children
+            self._apply_lora_to_model(child, self_attn_rank, cross_attn_rank, ff_rank, alphas, dropout, keys_to_lora, excluded_modules, path)
 
-            if child.__class__.__name__ in target_modules and module_path not in excluded_modules:
-                alpha_self, alpha_cross, alpha_ff = alphas
-                if hasattr(child, "attn1"):  # self-attention
-                    child.attn1 = LoRAAttentionWrapper(
-                        original_attn=child.attn1,
-                        rank=self_attn_rank,
-                        alpha=alpha_self,
-                        dropout=dropout,
-                        keys_to_lora=keys_to_lora,
-                    )
-                if hasattr(child, "attn2"):  # cross-attention
-                    child.attn2 = LoRAAttentionWrapper(
-                        original_attn=child.attn2,
-                        rank=cross_attn_rank,
-                        alpha=alpha_cross,
-                        dropout=dropout,
-                        keys_to_lora=keys_to_lora,
-                    )
-                if hasattr(child, "attn_face"): # New IP-Adapter face cross-attention
-                    child.attn_face = LoRAAttentionWrapper(
-                        original_attn=child.attn_face,
-                        rank=cross_attn_rank, # Re-use cross-attn rank and alpha
-                        alpha=alpha_cross,
-                        dropout=dropout,
-                        keys_to_lora=keys_to_lora,
-                    )
-                # Wrap MLPs in transformer blocks
-                if hasattr(child, "ff") and isinstance(getattr(child, "ff"), nn.Module):
-                    try:
-                        child.ff = LoRAFeedForwardWrapper(original_ff=child.ff, rank=ff_rank, alpha=alpha_ff, dropout=dropout)
-                    except Exception:
-                        pass
-                if hasattr(child, "ff_in") and isinstance(getattr(child, "ff_in"), nn.Module):
-                    try:
-                        child.ff_in = LoRAFeedForwardWrapper(original_ff=child.ff_in, rank=ff_rank, alpha=alpha_ff, dropout=dropout)
-                    except Exception:
-                        pass
-                    
-            # Recursively process child modules
-            self._wrap_attention_with_lora(child, target_modules, dropout, self_attn_rank, cross_attn_rank, ff_rank, alphas, keys_to_lora, excluded_modules, module_path)
+        # After recursion, check if the current module should be wrapped.
+        # This is a "duck-typing" approach.
+        is_transformer_block = hasattr(module, "attn1") and hasattr(module, "attn2") and hasattr(module, "ff")
+        
+        if is_transformer_block:
+            if skip_module_if_excluded(prefix, excluded_modules):
+                return
+                
+            alpha_self, alpha_cross, alpha_ff = alphas
+            
+            if hasattr(module, "attn1") and not isinstance(module.attn1, LoRAAttentionWrapper):
+                module.attn1 = LoRAAttentionWrapper(module.attn1, self_attn_rank, alpha_self, dropout, keys_to_lora)
+            
+            if hasattr(module, "attn2") and not isinstance(module.attn2, LoRAAttentionWrapper):
+                module.attn2 = LoRAAttentionWrapper(module.attn2, cross_attn_rank, alpha_cross, dropout, keys_to_lora)
+            
+            # if hasattr(module, "attn_face") and not isinstance(module.attn_face, LoRAAttentionWrapper):
+            #     module.attn_face = LoRAAttentionWrapper(module.attn_face, cross_attn_rank, alpha_cross, dropout, keys_to_lora)
 
+            if hasattr(module, "ff") and isinstance(module.ff, nn.Module) and not isinstance(module.ff, LoRAFeedForwardWrapper):
+                try:
+                    module.ff = LoRAFeedForwardWrapper(module.ff, ff_rank, alpha_ff, dropout)
+                except Exception: pass
+            
+            if hasattr(module, "ff_in") and isinstance(module.ff_in, nn.Module) and not isinstance(module.ff_in, LoRAFeedForwardWrapper):
+                try:
+                    module.ff_in = LoRAFeedForwardWrapper(module.ff_in, ff_rank, alpha_ff, dropout)
+                except Exception: pass
+                
     def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor, dense_y: torch.Tensor, num_frames: Optional[int] = None, face_context: Optional[torch.Tensor] = None) -> torch.Tensor:
         return self.seva_model(x, t, y, dense_y, num_frames, face_context)
 
