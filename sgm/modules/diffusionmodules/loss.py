@@ -159,7 +159,16 @@ class StandardDiffusionLoss(nn.Module):
         # Add auxiliary ArcFace identity loss if enabled
         if self.training and self.arcface_loss_weight > 0.0:
             arcface_loss = self.get_arcface_loss(network, batch)
+            print('loss:', loss)
+            print('arcface_loss:', arcface_loss, 'self.arcface_loss_weight:', self.arcface_loss_weight)
             loss = loss + self.arcface_loss_weight * arcface_loss
+            # clear for VRAM
+            if hasattr(network, "diffusion_model") and hasattr(
+                network.diffusion_model, "seva_model"
+            ):
+                network.diffusion_model.seva_model.predicted_arcface_embedding = None
+            else:
+                network.predicted_arcface_embedding = None
 
         return loss
 
@@ -192,14 +201,22 @@ class StandardDiffusionLoss(nn.Module):
         # We need to match them.
         if predicted_embed.shape[0] != gt_embed.shape[0]:
             num_frames = predicted_embed.shape[0] // gt_embed.shape[0]
-            gt_embed = repeat(gt_embed, "b ... -> (b f) ...", f=num_frames)
+            # Move to device before repeat to avoid intermediate device transfers
+            gt_embed_device = gt_embed.to(predicted_embed.device)
+            gt_embed = repeat(gt_embed_device, "b ... -> (b f) ...", f=num_frames)
+            del gt_embed_device  # Clear intermediate tensor
+        else:
+            gt_embed = gt_embed.to(predicted_embed.device)
 
         # Normalize both embeddings before comparing
-        predicted_embed = F.normalize(predicted_embed, p=2, dim=1)
-        gt_embed = F.normalize(gt_embed.to(predicted_embed.device), p=2, dim=1)
+        predicted_embed_norm = F.normalize(predicted_embed, p=2, dim=1)
+        gt_embed_norm = F.normalize(gt_embed, p=2, dim=1)
 
-        loss = 1.0 - F.cosine_similarity(predicted_embed, gt_embed, dim=1)
-        return loss.mean()
+        loss = 1.0 - F.cosine_similarity(predicted_embed_norm, gt_embed_norm, dim=1)
+        loss_mean = loss.mean()
+
+        del predicted_embed_norm, gt_embed_norm, loss
+        return loss_mean
 
     def get_face_weighting_loss(self, face_bbox, spatial_loss, ref_mask):
         """
@@ -215,11 +232,12 @@ class StandardDiffusionLoss(nn.Module):
         """
         B, T, C, H, W = spatial_loss.shape
         
-        # Create spatial mask for face regions
-        spatial_mask = torch.zeros_like(spatial_loss, dtype=torch.bool)
+        # Compute face loss per batch element directly without creating large boolean mask
+        # This avoids creating a [B, T, C, H, W] boolean tensor which can be memory intensive
+        face_loss = torch.zeros(B, device=spatial_loss.device, dtype=spatial_loss.dtype)
         
-        # Loop through batch and time to mark face regions
         for b in range(B):
+            batch_face_losses = []
             for t in range(T):
                 # Skip reference frames (ground truth)
                 if ref_mask[b, t]:
@@ -240,19 +258,12 @@ class StandardDiffusionLoss(nn.Module):
                 if x1_lat >= x2_lat or y1_lat >= y2_lat:
                     continue
                 
-                # Mark face region in mask
-                spatial_mask[b, t, :, y1_lat:y2_lat, x1_lat:x2_lat] = True
-        
-        # If no valid faces, return zero for all batch elements
-        if not spatial_mask.any():
-            return torch.zeros(B, device=spatial_loss.device, dtype=spatial_loss.dtype)
-        
-        # Compute face loss per batch element separately
-        face_loss = torch.zeros(B, device=spatial_loss.device, dtype=spatial_loss.dtype)
-        for b in range(B):
-            batch_mask = spatial_mask[b]
-            if batch_mask.any():
-                face_loss[b] = torch.mean(spatial_loss[b][batch_mask])
+                # Extract face region and compute mean loss directly
+                face_region_loss = spatial_loss[b, t, :, y1_lat:y2_lat, x1_lat:x2_lat]
+                batch_face_losses.append(face_region_loss.mean())
+            
+            if batch_face_losses:
+                face_loss[b] = torch.stack(batch_face_losses).mean()
         
         return face_loss
 

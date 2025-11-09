@@ -116,8 +116,8 @@ model:
             num_idx: 1000
             discretization_config:
               target: sgm.modules.diffusionmodules.discretizer.SevaDDPMDiscretization
-        face_weighting: 0.5
-        arcface_loss_weight: 0.1
+        face_weighting: 0.0
+        arcface_loss_weight: 1.0
         arcface_gt_key: "arcface_embedding"
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler

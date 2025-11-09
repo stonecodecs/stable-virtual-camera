@@ -224,12 +224,16 @@ class DiffusionEngine(pl.LightningModule):
         # load images from paths and convert to tensors
         B, num_images = ic_rgb.shape[0:2]
         latents_out = torch.empty(B, num_images, 4, 72, 72, device=self.device)
+        # Move entire batch to device once to avoid fragmentation from repeated transfers
+        ic_rgb_device = ic_rgb.to(self.device) if ic_rgb.device != self.device else ic_rgb
         with torch.no_grad():
             for i in range(B):
-                latents_out[i] = self.encode_first_stage(ic_rgb[i].to(self.device))
+                latents_out[i] = self.encode_first_stage(ic_rgb_device[i])
             # replace latents with clean latents for ref images
             latents_out[ref_mask] = clean_latent[ref_mask]
         self.en_and_decode_n_samples_a_time = old_chunk_size
+        # Clear reference to avoid keeping large tensor in memory
+        del ic_rgb_device
         return latents_out # latents_out is in GPU, rgb_images in CPU
 
     def shared_step(self, batch: Dict) -> Any: 

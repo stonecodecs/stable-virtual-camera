@@ -1,3 +1,4 @@
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_SOCKET_IFNAME=lo
 python main.py \
 --base configs/example_training/gen-seva-infu-identity.yaml \
