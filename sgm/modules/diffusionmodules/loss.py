@@ -60,6 +60,7 @@ class StandardDiffusionLoss(nn.Module):
         face_weighting: float = 0.0,
         arcface_loss_weight: float = 0.0,
         arcface_gt_key: str = "arcface_embedding",
+        **kwargs, # absorb unknown keys
     ):
         super().__init__()
 

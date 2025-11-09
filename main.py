@@ -199,6 +199,11 @@ def get_parser(**parser_kwargs):
         help="log to wandb",
     )
     parser.add_argument(
+        "--no-strict-loading",
+        action="store_true",
+        help="Set to True when loading a checkpoint with a modified architecture (e.g., adding IP-Adapter)."
+    )
+    parser.add_argument(
         "--override_ngpu",
         type=str,
         default=None,
@@ -1281,6 +1286,14 @@ if __name__ == "__main__":
         configs = [OmegaConf.load(cfg) for cfg in opt.base]
         cli = OmegaConf.from_dotlist(unknown)
         config = OmegaConf.merge(*configs, cli)
+
+        # Add strict_loading to model config if flag is present
+        if opt.no_strict_loading:
+            print("Setting model.strict_loading to False for non-strict checkpoint loading.")
+            if "params" not in config.model:
+                config.model.params = OmegaConf.create()
+            config.model.params.strict_loading = False
+
         lightning_config = config.pop("lightning", OmegaConf.create())
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
@@ -1317,6 +1330,59 @@ if __name__ == "__main__":
 
         # model
         model = instantiate_from_config(config.model) # DiffusionEngine
+
+        if ckpt_resume_path:
+            try:
+                print(f"Attempting weights-only load from checkpoint '{ckpt_resume_path}' "
+                    "(optimizer/scheduler WILL NOT be restored).")
+                ckpt = torch.load(ckpt_resume_path, map_location="cpu")
+
+                # Lightning checkpoints usually store the model under "state_dict"
+                if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                    sd = ckpt["state_dict"]
+                else:
+                    # If it's a bare state_dict or different format, try to use it directly
+                    sd = ckpt
+
+                # Determine strict flag from model config if present, otherwise True
+                strict_loading = True
+                try:
+                    # config.model may be an OmegaConf object
+                    if "params" in config.model and "strict_loading" in config.model.params:
+                        strict_loading = bool(config.model.params.strict_loading)
+                except Exception:
+                    # ignore and use default True
+                    strict_loading = True
+
+                # Load weights into model (ignores missing/unexpected keys according to strict_loading)
+                model.load_state_dict(sd, strict=strict_loading)
+                print("Weights-only load succeeded. Clearing ckpt_resume_path to avoid optimizer restore.")
+                # Prevent Lightning from restoring optimizer/scheduler state
+                ckpt_resume_path = None
+
+                # Clear any references in opt/trainer_config as a precaution
+                try:
+                    if hasattr(opt, "resume_from_checkpoint"):
+                        opt.resume_from_checkpoint = None
+                except Exception:
+                    pass
+                try:
+                    if "resume_from_checkpoint" in trainer_config:
+                        del trainer_config["resume_from_checkpoint"]
+                except Exception:
+                    pass
+
+                # If trainer_opt was already created as a Namespace, clear that field too
+                try:
+                    if "trainer_opt" in locals() and hasattr(trainer_opt, "resume_from_checkpoint"):
+                        trainer_opt.resume_from_checkpoint = None
+                except Exception:
+                    pass
+
+            except Exception as e:
+                # If weights-only load fails, keep ckpt_resume_path so Lightning can try full restore
+                print(f"Warning: weights-only load from checkpoint failed: {e!r}")
+                print("Proceeding with ckpt_resume_path unchanged so Lightning may attempt full resume.")
 
         # trainer and callbacks
         trainer_kwargs = dict()
@@ -1496,7 +1562,13 @@ if __name__ == "__main__":
         trainer_kwargs = {
             key: val for key, val in trainer_kwargs.items() if key not in trainer_opt
         } # logger, strategy, callbacks, etc.
+
         trainer = Trainer(**trainer_opt, **trainer_kwargs)
+        
+        # Manually set strict loading for the trainer if the flag is provided
+        if opt.no_strict_loading:
+            trainer.strict_loading = False
+            print("Trainer strict loading has been set to False.")
 
         trainer.logdir = logdir  ###
 
@@ -1563,7 +1635,7 @@ if __name__ == "__main__":
         # run
         if opt.train:
             try:
-                print(model)
+                ckpt_resume_path = None
                 trainer.fit(model, data, ckpt_path=ckpt_resume_path)
             except Exception as e:
                 print(f"Error: {e}")

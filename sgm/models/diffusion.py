@@ -47,9 +47,11 @@ class DiffusionEngine(pl.LightningModule):
         no_cond_log: bool = False,
         compile_model: bool = False,
         en_and_decode_n_samples_a_time: Optional[int] = None,
-        verbose_lora_deltas: bool = False
+        verbose_lora_deltas: bool = False,
+        strict_loading: bool = True,
     ):
         super().__init__()
+        self.strict_loading = strict_loading
         self.log_keys = log_keys
         self.input_key = input_key
         self.optimizer_config = default(

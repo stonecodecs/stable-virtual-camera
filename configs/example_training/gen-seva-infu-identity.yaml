@@ -62,6 +62,7 @@ model:
         keys_to_lora: [ q, k, v ]
         excluded_modules: []
         ff_rank: 128
+        lora_for_face_attn_only: true
     conditioner_config:
       target: sgm.modules.GeneralConditioner
       params:
@@ -166,7 +167,7 @@ lightning:
       params:
         disabled: false
         enable_autocast: false
-        batch_frequency: 5
+        batch_frequency: 20
         max_images: 8
         increase_log_steps: false
         log_first_step: false
