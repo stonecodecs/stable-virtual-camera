@@ -176,6 +176,10 @@ class StandardDiffusionLoss(nn.Module):
         """
         Computes the cosine similarity loss between predicted and ground-truth ArcFace embeddings.
         """
+        # Get device and dtype from network parameters to ensure consistency
+        device = next(network.parameters()).device
+        dtype = next(network.parameters()).dtype
+        
         # The path to the Seva model might vary depending on wrappers
         if hasattr(network, "diffusion_model") and hasattr(
             network.diffusion_model, "seva_model"
@@ -187,26 +191,26 @@ class StandardDiffusionLoss(nn.Module):
             predicted_embed = network.predicted_arcface_embedding
 
         if predicted_embed is None:
-            return torch.tensor(0.0, device=network.device)
+            return torch.tensor(0.0, device=device, dtype=dtype)
 
         gt_embed = batch.get(self.arcface_gt_key)
         if gt_embed is None:
-            return torch.tensor(0.0, device=network.device)
+            return torch.tensor(0.0, device=device, dtype=dtype)
 
         # The dataloader may yield GT embeddings with shape [B, 1, 512]
         if gt_embed.ndim == 3:
             gt_embed = gt_embed.squeeze(1)
 
-        # Predicted embeddings are [B*F, 512], GT embeddings from batch are likely [B, 512] or [B,F,512]
+        # [B, 1, 512]
         # We need to match them.
         if predicted_embed.shape[0] != gt_embed.shape[0]:
             num_frames = predicted_embed.shape[0] // gt_embed.shape[0]
-            # Move to device before repeat to avoid intermediate device transfers
-            gt_embed_device = gt_embed.to(predicted_embed.device)
+            # Move to device and dtype before repeat to avoid intermediate device transfers
+            gt_embed_device = gt_embed.to(device=predicted_embed.device, dtype=predicted_embed.dtype)
             gt_embed = repeat(gt_embed_device, "b ... -> (b f) ...", f=num_frames)
             del gt_embed_device  # Clear intermediate tensor
         else:
-            gt_embed = gt_embed.to(predicted_embed.device)
+            gt_embed = gt_embed.to(device=predicted_embed.device, dtype=predicted_embed.dtype)
 
         # Normalize both embeddings before comparing
         predicted_embed_norm = F.normalize(predicted_embed, p=2, dim=1)
