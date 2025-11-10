@@ -870,10 +870,12 @@ class ImageLogger(Callback):
                     ic = pl_module._encode_inconsistent_images(batch["ic_rgb"], batch["ref_mask"], batch["clean_latent"])
                     # for target (not input/ref) frames, zero condition latents
                     ic[~batch["mask"]] = 0
+                    rgb_ic = batch["ic_rgb"]
                 else:
                     # no conditioning (to be replaced by clean_latents for inputs)
                     ic = torch.zeros_like(batch["clean_latent"], device=pl_module.device)
                     ic[batch["ref_mask"]] = batch["clean_latent"][batch["ref_mask"]]
+                    rgb_ic = batch["frames"]
                 
                 batch.update({
                     "replace": torch.cat([
@@ -936,7 +938,9 @@ class ImageLogger(Callback):
 
                 # log to wandb stage
                 gt_images = batch["frames"][:N].to("cpu") # choose first N from B
+                rgb_ic = rgb_ic[:N].to("cpu")
                 ref_mask = batch["ref_mask"][:N].to("cpu") # put into CPU (when using CPU, otherwise GPU)
+                gt_images[~ref_mask] = rgb_ic[~ref_mask]
 
                 pre_images = {} # legacy name
                 pre_images["inputs"] = gt_images
