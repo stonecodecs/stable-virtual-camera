@@ -159,8 +159,6 @@ class StandardDiffusionLoss(nn.Module):
         # Add auxiliary ArcFace identity loss if enabled
         if self.training and self.arcface_loss_weight > 0.0:
             arcface_loss = self.get_arcface_loss(network, batch)
-            print('loss:', loss)
-            print('arcface_loss:', arcface_loss, 'self.arcface_loss_weight:', self.arcface_loss_weight)
             loss = loss + self.arcface_loss_weight * arcface_loss
             # clear for VRAM
             if hasattr(network, "diffusion_model") and hasattr(
