@@ -192,15 +192,10 @@ class StandardDiffusionLoss(nn.Module):
             return torch.tensor(0.0, device=device, dtype=dtype)
 
         gt_embed = batch.get(self.arcface_gt_key)
-        if gt_embed is None:
+        face_mask = torch.any(gt_embed, dim=2)# zero tensors don't count
+        if gt_embed is None or not face_mask.any():
             return torch.tensor(0.0, device=device, dtype=dtype)
 
-        # The dataloader may yield GT embeddings with shape [B, 1, 512]
-        if gt_embed.ndim == 3:
-            gt_embed = gt_embed.squeeze(1)
-
-        # [B, 1, 512]
-        # We need to match them.
         if predicted_embed.shape[0] != gt_embed.shape[0]:
             num_frames = predicted_embed.shape[0] // gt_embed.shape[0]
             # Move to device and dtype before repeat to avoid intermediate device transfers
@@ -210,9 +205,16 @@ class StandardDiffusionLoss(nn.Module):
         else:
             gt_embed = gt_embed.to(device=predicted_embed.device, dtype=predicted_embed.dtype)
 
+        # get average embedding for gt_embed, compare with predicted_embed
+        gt_embed_sum = gt_embed.sum(dim=1)
+        gt_embed_count = face_mask.sum(dim=1)
+        gt_embed_avg = gt_embed_sum / gt_embed_count.unsqueeze(-1)
+        gt_embed = gt_embed_avg.unsqueeze(1)
+        predicted_embed = predicted_embed * face_mask.unsqueeze(-1)
+
         # Normalize both embeddings before comparing
-        predicted_embed_norm = F.normalize(predicted_embed, p=2, dim=1)
         gt_embed_norm = F.normalize(gt_embed, p=2, dim=1)
+        predicted_embed_norm = F.normalize(predicted_embed, p=2, dim=1)
 
         loss = 1.0 - F.cosine_similarity(predicted_embed_norm, gt_embed_norm, dim=1)
         loss_mean = loss.mean(dim=1)
