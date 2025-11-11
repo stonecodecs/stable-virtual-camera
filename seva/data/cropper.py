@@ -264,7 +264,7 @@ class RandomBBoxCropper(object):
             cropped_img = images[i][:, int(y1[i]):int(y2[i]), int(x1[i]):int(x2[i])]
             cropped_images.append(cropped_img)
 
-        return cropped_images, K_new, rel_bbox, face_bboxes_new if face_bboxes is not None else None
+        return cropped_images, K_new, rel_bbox, face_bboxes_new if face_bboxes is not None else None, bbox
 
 
 def percent_to_absolute(arr, abs_arr):
