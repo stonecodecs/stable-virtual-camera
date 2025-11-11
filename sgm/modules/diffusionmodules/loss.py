@@ -192,7 +192,8 @@ class StandardDiffusionLoss(nn.Module):
             return torch.tensor(0.0, device=device, dtype=dtype)
 
         gt_embed = batch.get(self.arcface_gt_key)
-        face_mask = torch.any(gt_embed, dim=2)# zero tensors don't count
+        face_mask = torch.any(gt_embed, dim=2) # zero tensors don't count
+
         if gt_embed is None or not face_mask.any():
             return torch.tensor(0.0, device=device, dtype=dtype)
 
@@ -212,9 +213,13 @@ class StandardDiffusionLoss(nn.Module):
         gt_embed = gt_embed_avg.unsqueeze(1)
         predicted_embed = predicted_embed * face_mask.unsqueeze(-1)
 
+        # if nans, replace with 0
+        gt_embed = torch.where(torch.isnan(gt_embed), torch.zeros_like(gt_embed), gt_embed)
+        predicted_embed = torch.where(torch.isnan(predicted_embed), torch.zeros_like(predicted_embed), predicted_embed)
+        
         # Normalize both embeddings before comparing
-        gt_embed_norm = F.normalize(gt_embed, p=2, dim=1)
-        predicted_embed_norm = F.normalize(predicted_embed, p=2, dim=1)
+        gt_embed_norm = F.normalize(gt_embed, p=2, dim=2)
+        predicted_embed_norm = F.normalize(predicted_embed, p=2, dim=2)
 
         loss = 1.0 - F.cosine_similarity(predicted_embed_norm, gt_embed_norm, dim=1)
         loss_mean = loss.mean(dim=1)
