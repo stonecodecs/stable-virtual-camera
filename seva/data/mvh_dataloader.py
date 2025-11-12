@@ -712,16 +712,25 @@ class MVHumanNetDataset(Dataset):
                 sapiens_conditionings[cond] = []
                 for i, camera in enumerate(camera_order):
                     is_ref = self.ref_mask[i]
-                    is_infu = ic_mask[i] if ic_mask is not None else False
+                    is_iclight = ic_mask[i].item() if ic_mask is not None else False # True = ICLight, False = InfU
+                        
                     try: 
                         cond_tensor = None
-                        if is_ref: # (1500, 2048)
+                        if is_ref:
+                            # The reference frame always uses MVHN ground truth
                             cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="mvhn")
-                        elif ic_mask is not None and is_infu: # (576)^2
-                            # if no infu_random_indices, then it shouldn't hit here in the first place!
-                            cond_tensor = self._sapiens_get(cond, subject_id, camera, f"{infu_random_indices[i]:06d}", dataset_type="infu")
-                        elif input_frames_mask[i]: # ic-light (1024^2)
-                            cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="iclight")
+                        elif ic_mask is not None: 
+                            # We are in 'use_inconsistent=True' mode
+                            if is_iclight:
+                                # This is an IC-Light frame. Load ICLight sapiens data.
+                                cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="iclight")
+                            else:
+                                # This is an InfU frame. Load InfU sapiens data.
+                                cond_tensor = self._sapiens_get(cond, subject_id, camera, f"{infu_random_indices[i]:06d}", dataset_type="infu")
+                        elif input_frames_mask[i] and not is_ref:
+                            # This handles non-reference input frames when use_inconsistent=False
+                            # All "clean" data comes from MVHN
+                            cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="mvhn")
                         cond_tensor = torch.nan_to_num(cond_tensor, nan=0) # masks have 'nan' as background values
                     except Exception as e:
                         pass
@@ -846,7 +855,16 @@ class MVHumanNetDataset(Dataset):
                         cond_tensor = sapiens_conditionings[cond][i]
                         if ref_idx == i:
                             # if MVHN, crop using new_bbox 
-                            sapiens_conditionings[cond][i] = self.transform(cond_tensor[:, new_bbox[ref_idx][0]:new_bbox[ref_idx][2], new_bbox[ref_idx][1]:new_bbox[ref_idx][3]])
+                            padded_img, bbox = self.cropper._possibly_pad_img(
+                                cond_tensor.unsqueeze(0), 
+                                new_bbox[ref_idx][0].unsqueeze(0), 
+                                new_bbox[ref_idx][1].unsqueeze(0), 
+                                new_bbox[ref_idx][2].unsqueeze(0), 
+                                new_bbox[ref_idx][3].unsqueeze(0)
+                            )
+                            padded_img = padded_img.squeeze(0)
+                            bbox = bbox.squeeze(0)
+                            sapiens_conditionings[cond][ref_idx] = self.transform(padded_img[:, bbox[1]:bbox[3], bbox[0]:bbox[2]])
                         else:
                             # if IClight/InfU, transform to 576^2 then crop
                             sapiens_conditionings[cond][i] = self.transform(cond_tensor)[:, 0+dy1:self.target_shape[0]+dy2, 0+dx1:self.target_shape[1]+dx2]
