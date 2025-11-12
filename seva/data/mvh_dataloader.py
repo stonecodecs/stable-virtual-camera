@@ -234,7 +234,7 @@ class MVHumanNetDataset(Dataset):
         # actual data
         self.cam_params = {} # Dict[subject: (extrinsics, intrinsics, camera_scale)]
         self.face_bboxes = self._load_face_bboxes() if face_bbox_dir is not None else None # * needs to be loaded BEFORE scenes
-        self.scenes = self._load_scenes() if preload_path is None else self._load_preloaded_filepaths()
+        self.scenes = self._load_preloaded_filepaths()
         self.image_shape = (1500, 2048) # MVHumanNet images are 2048x1500
 
         # from SD 2.1 VAE
@@ -766,7 +766,7 @@ class MVHumanNetDataset(Dataset):
                     if cond_tensor is None:
                         if cond == "depth":
                             cond_tensor = torch.zeros((1, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
-                        elif cond == "seg":
+                        elif cond == "seg_masks":
                             cond_tensor = torch.zeros((28, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
                         elif cond == "latents":
                             cond_tensor = torch.zeros((4, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
@@ -880,8 +880,7 @@ class MVHumanNetDataset(Dataset):
                 if self.use_sapiens_conditioning is not None:
                     # only the ref images are cropped in this way
                     ref_idx = torch.where(ref_mask == True)[0][0].item()
-                    for cond in self.use_sapiens_conditioning:
-                        cond_tensor = sapiens_conditionings[cond][i]
+                    for cond in self.use_sapiens_conditioning:                        cond_tensor = sapiens_conditionings[cond][i]
                         if ref_idx == i:
                             # if MVHN, crop using new_bbox 
                             padded_img, bbox = self.cropper._possibly_pad_img(
@@ -891,12 +890,19 @@ class MVHumanNetDataset(Dataset):
                                 new_bbox[ref_idx][2].unsqueeze(0), 
                                 new_bbox[ref_idx][3].unsqueeze(0)
                             )
-                            padded_img = padded_img.squeeze(0)
+                            if isinstance(padded_img, list):
+                                padded_img = padded_img[0]
+                            else:
+                                padded_img = padded_img.squeeze(0)
                             bbox = bbox.squeeze(0)
-                            sapiens_conditionings[cond][ref_idx] = self.transform(padded_img[:, bbox[1]:bbox[3], bbox[0]:bbox[2]])
+                            cropped = padded_img[:, bbox[1]:bbox[3], bbox[0]:bbox[2]]
+                            sapiens_conditionings[cond][ref_idx] = T.Resize((self.target_shape[0], self.target_shape[1]))(cropped)
                         else:
-                            # if IClight/InfU, transform to 576^2 then crop
-                            sapiens_conditionings[cond][i] = self.transform(cond_tensor)[:, 0+dy1:self.target_shape[0]+dy2, 0+dx1:self.target_shape[1]+dx2]
+                            # if IClight/InfU
+                            cropped_cond_tensor = cond_tensor[:, 0+dy1:self.target_shape[0]+dy2, 0+dx1:self.target_shape[1]+dx2]
+                            sapiens_conditionings[cond][i] = T.Resize((self.target_shape[0], self.target_shape[1]))(cropped_cond_tensor)
+                        if cond == "seg_masks":
+                            sapiens_conditionings[cond][i] = one_hot_encode_segmentation(sapiens_conditionings[cond][i], 28)
             sapiens_conditionings = {cond: torch.stack(cond_tensor, dim=0) for cond, cond_tensor in sapiens_conditionings.items()}
             ic_rgb = ic_rgb_tensor
         else: # center crop + resize only (NOTE: set transform=None for this default behavior)
@@ -907,7 +913,9 @@ class MVHumanNetDataset(Dataset):
             if self.use_sapiens_conditioning is not None:
                 for cond in self.use_sapiens_conditioning:
                     for is_ref, cond_tensor in zip(ref_mask, sapiens_conditionings[cond]):
-                        cond_tensor = self.transform(cond_tensor) # both follows this old behavior
+                        cond_tensor = T.Resize((self.target_shape[0], self.target_shape[1]))(cond_tensor) # both follows this old behavior
+                        if cond == "seg_masks":
+                            cond_tensor = one_hot_encode_segmentation(cond_tensor, 28)
             sapiens_conditionings = {cond: torch.stack(cond_tensor, dim=0) for cond, cond_tensor in sapiens_conditionings.items()}
 
         # load latents if we provided a path

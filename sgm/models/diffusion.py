@@ -113,8 +113,8 @@ class DiffusionEngine(pl.LightningModule):
                     stride = 8
                 elif cond_type == "seg_masks":
                     # project all clasess to 4
-                    channels_to_use = self.sapiens_segmentation_channels_to_use
-                    in_channels = channels_to_use if len(channels_to_use) > 0 else 28 # (all of them)
+                    channels_to_use = len(self.sapiens_segmentation_channels_to_use)
+                    in_channels = channels_to_use if channels_to_use > 0 else 28 # (all of them)
                     out_channels = 4
                     kernel_size = 8
                     stride = 8
