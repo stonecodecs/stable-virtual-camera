@@ -880,7 +880,8 @@ class MVHumanNetDataset(Dataset):
                 if self.use_sapiens_conditioning is not None:
                     # only the ref images are cropped in this way
                     ref_idx = torch.where(ref_mask == True)[0][0].item()
-                    for cond in self.use_sapiens_conditioning:                        cond_tensor = sapiens_conditionings[cond][i]
+                    for cond in self.use_sapiens_conditioning:
+                        cond_tensor = sapiens_conditionings[cond][i]
                         if ref_idx == i:
                             # if MVHN, crop using new_bbox 
                             padded_img, bbox = self.cropper._possibly_pad_img(
