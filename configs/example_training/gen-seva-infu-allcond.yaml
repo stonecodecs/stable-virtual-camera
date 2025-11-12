@@ -5,6 +5,9 @@ model:
     scale_factor: 0.18215
     disable_first_stage_autocast: true
     input_key: clean_latent
+    ### match this with MVHumanNetLoader!
+    use_sapiens_conditioning: [ "depth", "seg_masks" ]
+    ###
     network_wrapper: sgm.modules.diffusionmodules.wrappers.SevaWrapper
     scheduler_config:
       target: sgm.lr_scheduler.LambdaLinearScheduler
@@ -35,7 +38,7 @@ model:
           params:
             load_pretrained: false # IMPORTANT: Set to false to avoid loading base weights that don't have IP-Adapter layers
             params:
-              in_channels: 16
+              in_channels: 21 # 16 + 5 (post projection: 4[seg_masks] + 1[depth])
               model_channels: 320
               out_channels: 4
               num_frames: 8
@@ -145,7 +148,9 @@ data:
     infu_dataset_path: /workspace/datasetvol/mvhuman_data/inconsistent_images
     # face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
     arcface_embeddings_dir: /workspace/datasetvol/mvhuman_data/arcface_embeddings # New path for arcface embeddings
-    use_sapiens_conditioning: [ "depth", "seg" ]
+    ### match this with DiffusionEngine!
+    use_sapiens_conditioning: [ "depth", "seg_masks" ]
+    ###
     maximal_crop: true
     random_crop: true
     use_inconsistent: true

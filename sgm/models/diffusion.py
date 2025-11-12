@@ -49,11 +49,15 @@ class DiffusionEngine(pl.LightningModule):
         en_and_decode_n_samples_a_time: Optional[int] = None,
         verbose_lora_deltas: bool = False,
         strict_loading: bool = True,
+        use_sapiens_conditioning: list = [],
+        sapiens_segmentation_channels_to_use: list = [],
     ):
         super().__init__()
         self.strict_loading = strict_loading
         self.log_keys = log_keys
         self.input_key = input_key
+        self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
+        self.use_sapiens_conditioning = use_sapiens_conditioning
         self.optimizer_config = default(
             optimizer_config, {"target": "torch.optim.AdamW"}
         )
@@ -94,6 +98,37 @@ class DiffusionEngine(pl.LightningModule):
 
         self.en_and_decode_n_samples_a_time = en_and_decode_n_samples_a_time
         self.verbose_lora_deltas = verbose_lora_deltas
+
+        # In DiffusionEngine.__init__, after self.conditioner initialization
+        # Add sapiens conditioning projection layers
+        self.sapiens_projections = torch.nn.ModuleDict()
+        if hasattr(self, 'use_sapiens_conditioning') and self.use_sapiens_conditioning is not None:
+            # You'll need to pass this as a config parameter
+            # For now, assuming you know the input/output channels
+            for cond_type in self.use_sapiens_conditioning:
+                if cond_type == "depth":
+                    in_channels = 1
+                    out_channels = 1
+                    kernel_size = 8
+                    stride = 8
+                elif cond_type == "seg_masks":
+                    # project all clasess to 4
+                    channels_to_use = self.sapiens_segmentation_channels_to_use
+                    in_channels = channels_to_use if len(channels_to_use) > 0 else 28 # (all of them)
+                    out_channels = 4
+                    kernel_size = 8
+                    stride = 8
+                elif cond_type == "latents":
+                    in_channels = 4
+                    out_channels = in_channels # same dimension as VAE
+                    kernel_size = 1
+                    stride = 1
+                else:
+                    continue
+                
+                self.sapiens_projections[cond_type] = torch.nn.Sequential(
+                    torch.nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride), # ! HARDCODED to match VAE
+                )
 
     def init_from_ckpt(
         self,
@@ -195,6 +230,34 @@ class DiffusionEngine(pl.LightningModule):
             ic = torch.zeros_like(batch["clean_latent"], device=self.device)
             ic[batch["ref_mask"]] = batch["clean_latent"][batch["ref_mask"]]
 
+        # Project and concatenate sapiens conditionals if present
+        sapiens_projected = []
+        if "sapiens_conditioning" in batch and batch["sapiens_conditioning"] is not None:
+            for cond_type, cond_tensor in batch["sapiens_conditioning"].items():
+                if cond_type in self.sapiens_projections:
+                    # cond_tensor shape: (B, T, C, H, W)
+                    B, T, C, H, W = cond_tensor.shape
+                    # Reshape to (B*T, C, H, W) for conv2d
+                    cond_flat = cond_tensor.view(B * T, C, H, W).to(self.device)
+                    # Project
+                    projected = self.sapiens_projections[cond_type](cond_flat)
+                    # Reshape back to (B, T, C_out, H, W)
+                    if cond_type == "latents":
+                        projected = projected.view(B, T, 4, 72, 72)
+                    else:
+                        projected = projected.view(B, T, -1, H//8, W//8)
+                    sapiens_projected.append(projected)
+        
+        # Concatenate all projected sapiens conditionals
+        if sapiens_projected:
+            sapiens_concat = torch.cat(sapiens_projected, dim=2)  # (B, T, sum(C_out), H, W)
+        else:
+            sapiens_concat = None
+
+        concat_list = [batch["concat"], ic]
+        if sapiens_concat is not None:
+            concat_list.append(sapiens_concat)
+
         # ensure for ref image, ic tensors should be replaced by clean latents 
         # add ic as conditioning in concat (along with clean + plucker + masks)
         batch.update({
@@ -207,7 +270,7 @@ class DiffusionEngine(pl.LightningModule):
                     w=batch["plucker"].shape[-1]
                 )
             ], dim=2),
-            "concat": torch.cat([batch["concat"], ic], dim=2)
+            "concat": torch.cat(concat_list, dim=2)
         }) # concat to be (B, T, 6(plucker) + 2(masks) + 4(ic))
         return x, batch
 
@@ -436,6 +499,12 @@ class DiffusionEngine(pl.LightningModule):
         for embedder in self.conditioner.embedders:
             if embedder.is_trainable:
                 params = params + list(embedder.parameters())
+
+        # for sapiens projection layers
+        if hasattr(self, 'sapiens_projections') and self.sapiens_projections is not None:
+            for projection in self.sapiens_projections.values():
+                params = params + list(projection.parameters()) if isinstance(projection, torch.nn.Module) else []
+
         opt = self.instantiate_optimizer_from_config(params, lr, self.optimizer_config) # AdamW
         if self.scheduler_config is not None:
             scheduler = instantiate_from_config(self.scheduler_config) # LambdaLinearScheduler

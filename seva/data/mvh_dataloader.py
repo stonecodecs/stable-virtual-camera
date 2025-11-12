@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import multivariate_normal
 from PIL import Image
 import torchvision.transforms.v2 as T
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from seva.data.preprocessing import (
     update_intrinsics,
@@ -126,6 +127,32 @@ def read_from_hdf5(hdf5_file, *args):
         return None
 
 
+def one_hot_encode_segmentation(seg_map: torch.Tensor, num_classes: int, classes_to_use: list = []) -> torch.Tensor:
+    """
+    Converts a segmentation label map to a one-hot encoded tensor.
+
+    Args:
+        seg_map (torch.Tensor): The segmentation map. 
+                                Expected shape (1, H, W) or (H, W).
+                                Must contain class indices (e.g., 0, 1, ... N-1).
+        num_classes (int): The total number of classes.
+
+    Returns:
+        torch.Tensor: The one-hot encoded tensor of shape (num_classes, H, W).
+    """
+    if len(classes_to_use) > 0:
+        seg_map_ = seg_map[classes_to_use]
+    else: # otherwise, use all classes if empty
+        seg_map_ = seg_map
+    # Squeeze out the channel dim if it exists, (1, H, W) -> (H, W)
+    if seg_map_.dim() == 3 and seg_map_.shape[0] == 1:
+        seg_map_ = seg_map_.squeeze(0)
+    
+    seg_map_long_ = seg_map_.long()
+    one_hot = F.one_hot(seg_map_long_, num_classes=num_classes)
+    one_hot_ = one_hot.permute(2, 0, 1)
+    return one_hot_.float()
+
 class MVHumanNetDataset(Dataset):
     def __init__(
         self,
@@ -152,6 +179,7 @@ class MVHumanNetDataset(Dataset):
         ic_sampling_prob=0.7, # probability of randomly sampling from InfU over IC light
         fixed_sampling_ids=None,
         use_sapiens_conditioning=None, # list of "depth, seg, latents" later
+        sapiens_segmentation_channels_to_use=[], # face
     ):
         self.root_dir = root_dir             # directory of all subject directories
         self.latents_dir = latents_dir       # directory of all latents
@@ -177,6 +205,7 @@ class MVHumanNetDataset(Dataset):
         # and will repeat the clean latent for the input images
         self.use_sapiens_conditioning = use_sapiens_conditioning
         assert self.use_sapiens_conditioning is None or all(cond in ["depth", "seg_masks", "latents"] for cond in self.use_sapiens_conditioning), "Invalid sapiens conditioning!"
+        self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
         self.fixed_sampling_ids = fixed_sampling_ids
         self.adjacent_frame_sampling_prob = 0.2 # Trajectory NVS acceptance rate
         self.all_inputs_prob = 0.8
@@ -909,13 +938,13 @@ class MVHumanNetDataset(Dataset):
                     h=pluckers.shape[2],
                     w=pluckers.shape[3],
                 ),
+                pluckers,
                 repeat(
                     ref_mask, 
                     "n -> n 1 h w", 
                     h=pluckers.shape[2],
                     w=pluckers.shape[3] 
                 ),
-                pluckers,
             ],
             dim=1,
         ) # (T, 6 + 1, 72, 72), where 6 is for plucker coords and 1 for binary mask
@@ -1021,6 +1050,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
         ic_sampling_prob: float = 0.7,
         fixed_sampling_ids: list = None,
         use_sapiens_conditioning: list = None,
+        sapiens_segmentation_channels_to_use: list = None,
     ):
         super().__init__()
         print("init of DATALOADER")
@@ -1047,6 +1077,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
         self.ic_sampling_prob = ic_sampling_prob
         self.fixed_sampling_ids = fixed_sampling_ids
         self.use_sapiens_conditioning = use_sapiens_conditioning
+        self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
         # Define transforms
         # self.transform = T.Compose([
         #     T.Resize(image_size), # whatever final resolution we want here
@@ -1098,6 +1129,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 ic_sampling_prob=self.ic_sampling_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
                 use_sapiens_conditioning=self.use_sapiens_conditioning,
+                sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
             )
 
         if stage == "validate" or stage is None:
@@ -1123,6 +1155,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 random_crop_prob=self.random_crop_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
                 use_sapiens_conditioning=self.use_sapiens_conditioning,
+                sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
             )
         if stage == "test" or stage is None:
             self.test_dataset = MVHumanNetDataset(
@@ -1146,6 +1179,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 random_crop_prob=self.random_crop_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
                 use_sapiens_conditioning=self.use_sapiens_conditioning,
+                sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
             )
             
     def prepare_data(self):
