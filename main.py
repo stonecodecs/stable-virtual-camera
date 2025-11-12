@@ -876,7 +876,35 @@ class ImageLogger(Callback):
                     ic = torch.zeros_like(batch["clean_latent"], device=pl_module.device)
                     ic[batch["ref_mask"]] = batch["clean_latent"][batch["ref_mask"]]
                     rgb_ic = batch["frames"]
+
+                # Project and concatenate sapiens conditionals if present
+                sapiens_projected = []
+                if "sapiens_conditioning" in batch and batch["sapiens_conditioning"] is not None:
+                    for cond_type, cond_tensor in batch["sapiens_conditioning"].items():
+                        if cond_type in pl_module.sapiens_projections:
+                            # cond_tensor shape: (B, T, C, H, W)
+                            B, T, C, H, W = cond_tensor.shape
+                            # Reshape to (B*T, C, H, W) for conv2d
+                            cond_flat = cond_tensor.view(B * T, C, H, W).to(pl_module.device)
+                            # Project
+                            projected = pl_module.sapiens_projections[cond_type](cond_flat)
+                            # Reshape back to (B, T, C_out, H, W)
+                            if cond_type == "latents":
+                                projected = projected.view(B, T, 4, 72, 72)
+                            else:
+                                projected = projected.view(B, T, -1, H//8, W//8)
+                            sapiens_projected.append(projected)
                 
+                # Concatenate all projected sapiens conditionals
+                if sapiens_projected:
+                    sapiens_concat = torch.cat(sapiens_projected, dim=2)  # (B, T, sum(C_out), H, W)
+                else:
+                    sapiens_concat = None
+
+                concat_list = [batch["concat"], ic]
+                if sapiens_concat is not None:
+                    concat_list.append(sapiens_concat)
+
                 batch.update({
                     "replace": torch.cat([
                         batch["clean_latent"],
@@ -887,7 +915,7 @@ class ImageLogger(Callback):
                             w=batch["plucker"].shape[-1]
                         )
                     ], dim=2),
-                    "concat": torch.cat([batch["concat"], ic], dim=2)
+                    "concat": torch.cat(concat_list, dim=2)
                 })
 
                 conditioner_input_keys = [e.input_key for e in pl_module.conditioner.embedders]
