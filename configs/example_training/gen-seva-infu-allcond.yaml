@@ -66,6 +66,7 @@ model:
         excluded_modules: []
         ff_rank: 128
         lora_for_face_attn_only: true
+        freeze_lora: true
     conditioner_config:
       target: sgm.modules.GeneralConditioner
       params:
@@ -138,7 +139,7 @@ data:
   params:
     root_dir: /workspace/datasetvol/mvhuman_data/mv_captures
     batch_size: 2
-    num_workers: 4
+    num_workers: 2
     num_images: 8
     step_size: 60
     only_include: 100001-100010
@@ -173,7 +174,7 @@ lightning:
       params:
         disabled: false
         enable_autocast: false
-        batch_frequency: 20
+        batch_frequency: 3
         max_images: 8
         increase_log_steps: false
         log_first_step: false

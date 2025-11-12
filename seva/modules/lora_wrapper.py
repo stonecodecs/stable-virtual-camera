@@ -29,6 +29,7 @@ class SevaLoRAWrapper(nn.Module):
         keys_to_lora: list[str] = ["q", "k", "v"],
         excluded_modules: list[str] = [],
         lora_for_face_attn_only: bool = False,
+        freeze_lora: bool = False,
     ):
         super().__init__()
         self.seva_model: nn.Module = cast(nn.Module, instantiate_from_config(seva_model_config))
@@ -65,12 +66,17 @@ class SevaLoRAWrapper(nn.Module):
             self.excluded_modules
         )
 
+        if freeze_lora:
+            # freeze all parameters, even LoRA weights
+            self.freeze_all()
+            print("[SevaLoRAWrapper] LoRA is frozen.")
+
         if lora_for_face_attn_only:
-            # Unfreeze only the face attention blocks.
+            # unfreeze only the face attention blocks.
             for name, module in self.seva_model.named_modules():
                 if 'attn_face' in name:
                     module.requires_grad_(True)
-                    print(f"SevaLoRAWrapper: Unfroze all parameters for {name}")
+                    print(f"[SevaLoRAWrapper] Unfroze all parameters for {name}")
 
     def _apply_lora_to_model(self, module, self_attn_rank, cross_attn_rank, ff_rank, alphas, dropout, keys_to_lora, excluded_modules, prefix=""):
         """
@@ -128,3 +134,19 @@ class SevaLoRAWrapper(nn.Module):
         """Load only the LoRA weights."""
         lora_state_dict = torch.load(path)
         self.load_state_dict(lora_state_dict, strict=False) 
+
+    def freeze_all(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        for module in self.modules():
+            if isinstance(module, nn.Module):
+                for param in module.parameters():
+                    param.requires_grad = False
+
+    def unfreeze_all(self):
+        for param in self.parameters():
+            param.requires_grad = True
+        for module in self.modules():
+            if isinstance(module, nn.Module):
+                for param in module.parameters():
+                    param.requires_grad = True
