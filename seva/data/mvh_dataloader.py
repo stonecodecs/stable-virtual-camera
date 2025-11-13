@@ -226,7 +226,8 @@ class MVHumanNetDataset(Dataset):
                     continue
                 if self.only_include is not None and subject_id not in self.only_include:
                     continue
-                self.infu_num_images[subject_id] = len(os.listdir(os.path.join(self.infu_dataset_path, subject_id)))
+                self.infu_num_images[subject_id] = len(os.listdir(os.path.join(self.infu_dataset_path, subject_id))) - 2
+                # -2 is a HACK to avoid I/O checking; this accounts for the npz masks
 
         if self.num_images > 16: # if more than 16, disable trajectory NVS batching
             self.adjacent_frame_sampling_prob = 0.0
