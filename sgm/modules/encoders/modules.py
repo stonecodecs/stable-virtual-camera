@@ -238,11 +238,13 @@ class IdentityEncoder(AbstractEmbModel):
 class SevaAutoencoder(AbstractEmbModel):
     def __init__(self, chunk_size: int | None = None, scale_factor: float = 0.18215):
         super().__init__()
+        # "stabilityai/stable-diffusion-2-1-base",
         self.module = AutoencoderKL.from_pretrained(
-            "stabilityai/stable-diffusion-2-1-base",
+            "/root/.cache/huggingface/hub/models--stabilityai--stable-diffusion-2-1-base/snapshots/5ede9e4bf3e3fd1cb0ef2f7a3fff13ee514fdf06/", 
             subfolder="vae",
             force_download=False,
             low_cpu_mem_usage=False,
+            local_files_only=True
         )
         self.module.eval().requires_grad_(False)  # type: ignore
         self.chunk_size = chunk_size

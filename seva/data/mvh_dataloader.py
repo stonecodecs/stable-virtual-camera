@@ -768,7 +768,8 @@ class MVHumanNetDataset(Dataset):
                         if cond == "depth":
                             cond_tensor = torch.zeros((1, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
                         elif cond == "seg_masks":
-                            cond_tensor = torch.zeros((28, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+                            # expand later using one_hot_encode_segmentation
+                            cond_tensor = torch.zeros((1, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
                         elif cond == "latents":
                             cond_tensor = torch.zeros((4, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
                     else:
