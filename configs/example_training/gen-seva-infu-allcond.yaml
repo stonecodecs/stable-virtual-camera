@@ -121,7 +121,7 @@ model:
             discretization_config:
               target: sgm.modules.diffusionmodules.discretizer.SevaDDPMDiscretization
         face_weighting: 0.0
-        arcface_loss_weight: 1.0
+        arcface_loss_weight: 0.3
         arcface_gt_key: "arcface_embedding"
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler
@@ -142,8 +142,8 @@ data:
     num_workers: 2
     num_images: 8
     step_size: 60
-    only_include: 100001-100010
-    val_include: 100011-100014
+    only_include: 100001-100490
+    val_include: 100491-100499
     preload_path: /workspace/datasetvol/mvhuman_data/mv_captures/preloaded_filepaths1.json
     iclight_dataset_path: /workspace/datasetvol/mvhuman_data/relit_images
     infu_dataset_path: /workspace/datasetvol/mvhuman_data/inconsistent_images
@@ -174,7 +174,7 @@ lightning:
       params:
         disabled: false
         enable_autocast: false
-        batch_frequency: 3
+        batch_frequency: 100
         max_images: 8
         increase_log_steps: false
         log_first_step: false
