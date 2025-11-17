@@ -25,6 +25,7 @@ from pytorch_lightning.utilities import rank_zero_only
 from diffusers import AutoencoderKL
 from seva.sampling import MultiviewCFG
 from sgm.util import exists, instantiate_from_config, isheatmap
+from sgm.models.diffusion import initialize_new_channel_weights
 import matplotlib.cm as cm
 from matplotlib.image import imread
 import torch.nn.functional as F
@@ -1375,6 +1376,9 @@ if __name__ == "__main__":
                 else:
                     # If it's a bare state_dict or different format, try to use it directly
                     sd = ckpt
+
+                # Initialize new channel weights if model has more input channels than checkpoint
+                sd = initialize_new_channel_weights(sd, model, verbose=True)
 
                 # Determine strict flag from model config if present, otherwise True
                 strict_loading = True
