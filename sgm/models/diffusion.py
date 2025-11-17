@@ -25,6 +25,118 @@ def compute_psnr(pred, target):
     return 10 * torch.log10(1.0 / mse)
 
 
+def initialize_new_channel_weights(state_dict, model, verbose=True):
+    """
+    Initialize weights for new input channels when loading a checkpoint with a fewer  channels.
+    
+    This function handles the case where the current model has more input channels than
+    the checkpoint. It initializes the new channel weights by averaging existing channel
+    weights, which is better than random initialization.
+    
+    Args:
+        state_dict: The state dict from the checkpoint
+        model: The current model (DiffusionEngine)
+        verbose: Whether to print information about the initialization
+    
+    Returns:
+        Modified state_dict with properly initialized new channel weights
+    """
+    # Possible key prefixes for the first conv layer depending on wrapper
+    possible_keys = [
+        "model.seva_model.input_blocks.0.0.weight",
+        "model.seva_model.input_blocks.0.0.bias",
+        "model.module.input_blocks.0.0.weight",
+        "model.module.input_blocks.0.0.bias",
+        "model.diffusion_model.input_blocks.0.0.weight",
+        "model.diffusion_model.input_blocks.0.0.bias",
+        "model.input_blocks.0.0.weight",
+        "model.input_blocks.0.0.bias",
+        "seva_model.input_blocks.0.0.weight",
+        "seva_model.input_blocks.0.0.bias",
+        "input_blocks.0.0.weight",
+        "input_blocks.0.0.bias",
+    ]
+    
+    # Find the weight key in the checkpoint
+    weight_key = None
+    bias_key = None
+    
+    # First try exact matches
+    for key in possible_keys:
+        if key.endswith(".weight") and key in state_dict:
+            weight_key = key
+            # Find corresponding bias key
+            bias_key = key.replace(".weight", ".bias")
+            if bias_key not in state_dict:
+                bias_key = None
+            break
+    
+    # If no exact match, try to find any key that ends with input_blocks.0.0.weight
+    if weight_key is None:
+        for key in state_dict.keys():
+            if key.endswith("input_blocks.0.0.weight") or key.endswith(".input_blocks.0.0.weight"):
+                weight_key = key
+                bias_key = key.replace(".weight", ".bias")
+                if bias_key not in state_dict:
+                    bias_key = None
+                break
+    
+    if weight_key is None:
+        if verbose:
+            print("Could not find first conv layer in checkpoint, skipping channel initialization")
+        return state_dict
+    
+    # Get checkpoint weights
+    ckpt_weight = state_dict[weight_key]  # [out_channels, old_in_channels, 3, 3]
+    ckpt_bias = state_dict[bias_key] if bias_key else None
+    
+    old_in_channels = ckpt_weight.shape[1]
+    
+    # Find the actual first conv layer in the current model
+    # Try to access through the wrapped model
+    first_conv = None
+    try:
+        actual_model = model.model.diffusion_model
+        first_conv = actual_model.seva_model.input_blocks[0][0]
+        if first_conv is None:
+            raise ValueError()
+    except:
+        print("Could not find first conv layer in current model, skipping channel initialization")
+        return state_dict
+
+    new_in_channels = first_conv.in_channels
+    out_channels = first_conv.out_channels
+    
+    if old_in_channels >= new_in_channels:
+        # No new channels to initialize
+        return state_dict
+    
+    if verbose:
+        print(f"Initializing {new_in_channels - old_in_channels} new input channels "
+              f"(from {old_in_channels} to {new_in_channels})")
+    
+    # Create new weight tensor
+    new_weight = torch.zeros(out_channels, new_in_channels, 3, 3, dtype=ckpt_weight.dtype)
+    
+    # Copy existing weights
+    new_weight[:, :old_in_channels, :, :] = ckpt_weight
+    
+    # Update state dict
+    state_dict[weight_key] = new_weight
+    
+    # Handle bias if present
+    if ckpt_bias is not None and bias_key:
+        new_bias = torch.zeros(out_channels, dtype=ckpt_bias.dtype)
+        new_bias[:ckpt_bias.shape[0]] = ckpt_bias
+        # New channels don't add bias (bias is per output channel, not input channel)
+        state_dict[bias_key] = new_bias
+    
+    if verbose:
+        print(f"Successfully initialized new channel weights for key: {weight_key}")
+    
+    return state_dict
+
+
 class DiffusionEngine(pl.LightningModule):
     def __init__(
         self,
@@ -127,7 +239,7 @@ class DiffusionEngine(pl.LightningModule):
                     continue
                 
                 self.sapiens_projections[cond_type] = torch.nn.Sequential(
-                    torch.nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride), # ! HARDCODED to match VAE
+                    torch.nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride) # ! HARDCODED to match VAE
                 )
 
     def init_from_ckpt(
@@ -140,6 +252,9 @@ class DiffusionEngine(pl.LightningModule):
             sd = load_safetensors(path)
         else:
             raise NotImplementedError
+
+        # Initialize new channel weights if model has more input channels than checkpoint
+        sd = initialize_new_channel_weights(sd, self, verbose=True)
 
         missing, unexpected = self.load_state_dict(sd, strict=False)
         print(
@@ -241,10 +356,15 @@ class DiffusionEngine(pl.LightningModule):
                     cond_flat = cond_tensor.view(B * T, C, H, W).to(self.device)
                     # Project
                     projected = self.sapiens_projections[cond_type](cond_flat)
-                    # Reshape back to (B, T, C_out, H, W)
+                    # Scale to match the scale of other channels (IC latents use scale_factor)
+                    # This prevents the new channels from dominating the output
                     if cond_type == "latents":
+                        # Latents should match the scale of IC latents
+                        projected = projected * self.scale_factor
                         projected = projected.view(B, T, 4, 72, 72)
                     else:
+                        # For depth/segmentation, scale down to match typical latent scale
+                        # GroupNorm outputs are roughly normalized, so scale to match latent range
                         projected = projected.view(B, T, -1, H//8, W//8)
                     sapiens_projected.append(projected)
         
