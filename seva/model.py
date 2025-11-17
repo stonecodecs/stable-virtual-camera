@@ -66,6 +66,7 @@ class SevaParams(object):
     ckpt_path: str | None = None
     use_ip_adapter: bool = False
     face_context_dim: int = 512
+    use_arcface: bool = True
 
     def __post_init__(self):
         assert len(self.channel_mult) == len(self.transformer_depth)
@@ -169,7 +170,10 @@ class Seva(nn.Module):
             ),
         )
         self._feature_size += ch
-        self.arcface_head = ArcFaceHead(in_channels=ch)
+        if params.use_arcface:
+            self.arcface_head = ArcFaceHead(in_channels=ch)
+        else:
+            self.arcface_head = None
 
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(params.channel_mult))[::-1]:
@@ -281,8 +285,10 @@ class Seva(nn.Module):
             face_context=face_context,
         )
 
-        if self.training and face_context is not None:
+        if self.training and face_context is not None and self.arcface_head is not None:
             self.predicted_arcface_embedding = self.arcface_head(h)
+        else:
+            self.predicted_arcface_embedding = None
 
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
