@@ -635,6 +635,7 @@ class MVHumanNetDataset(Dataset):
             # NOTE: if using non-cropped latents, then transforms is just the default as in @dataset.py
             # masked_image = self.transform(masked_image) # ! moved transform to after random crop
             frames[i] = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])(masked_image)
+            del image, img_mask, masked_image
 
         # Sample input/target frame split
         if not self.use_inconsistent:

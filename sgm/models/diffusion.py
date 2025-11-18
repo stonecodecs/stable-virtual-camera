@@ -377,6 +377,7 @@ class DiffusionEngine(pl.LightningModule):
         concat_list = [batch["concat"], ic]
         if sapiens_concat is not None:
             concat_list.append(sapiens_concat)
+            del batch["sapiens_conditioning"] 
 
         # ensure for ref image, ic tensors should be replaced by clean latents 
         # add ic as conditioning in concat (along with clean + plucker + masks)
