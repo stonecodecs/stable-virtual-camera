@@ -24,7 +24,7 @@ class ArcFaceHead(nn.Module):
     Projects features from the middle block of the U-Net to the ArcFace embedding space.
     """
 
-    def __init__(self, in_channels: int, out_channels: int = 512):
+    def __init__(self, in_channels: int, out_channels: int = 512, num_images: int = 8):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -42,7 +42,7 @@ class ArcFaceHead(nn.Module):
         x = x.flatten(start_dim=1, end_dim=3)
         x = self.norm(x)
         x = self.proj(x)
-        x = x.reshape(-1, 8, self.out_channels) # ! 8 hardcoded for now
+        x = x.reshape(-1, num_images, self.out_channels) # ! 8 hardcoded for now
         return x
 
 
@@ -66,7 +66,7 @@ class SevaParams(object):
     ckpt_path: str | None = None
     use_ip_adapter: bool = False
     face_context_dim: int = 512
-    use_arcface: bool = True
+    use_id_head: bool = True
 
     def __post_init__(self):
         assert len(self.channel_mult) == len(self.transformer_depth)
@@ -170,8 +170,8 @@ class Seva(nn.Module):
             ),
         )
         self._feature_size += ch
-        if params.use_arcface:
-            self.arcface_head = ArcFaceHead(in_channels=ch)
+        if params.use_id_head:
+            self.arcface_head = ArcFaceHead(in_channels=ch, num_images=params.num_frames)
         else:
             self.arcface_head = None
 
