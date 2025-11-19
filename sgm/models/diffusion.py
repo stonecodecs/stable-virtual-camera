@@ -228,8 +228,8 @@ class DiffusionEngine(pl.LightningModule):
                     channels_to_use = len(self.sapiens_segmentation_channels_to_use)
                     in_channels = channels_to_use if channels_to_use > 0 else 28 # (all of them)
                     out_channels = 4
-                    kernel_size = 8
-                    stride = 8
+                    kernel_size = 3
+                    stride = 2
                 elif cond_type == "latents":
                     in_channels = 4
                     out_channels = in_channels # same dimension as VAE
@@ -238,9 +238,28 @@ class DiffusionEngine(pl.LightningModule):
                 else:
                     continue
                 
-                self.sapiens_projections[cond_type] = torch.nn.Sequential(
-                    torch.nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride) # ! HARDCODED to match VAE
-                )
+                if cond_type == "depth":
+                    self.sapiens_projections[cond_type] = torch.nn.Sequential(
+                        torch.nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride)
+                    )
+                elif cond_type == "seg_masks":
+                    self.sapiens_projections[cond_type] = torch.nn.Sequential(
+                        torch.nn.Conv2d(in_channels, 64, kernel_size=kernel_size, stride=stride, padding=1),
+                        torch.nn.GroupNorm(32, 64),
+                        torch.nn.SiLU(),
+                        torch.nn.Conv2d(64, 128, kernel_size=kernel_size, stride=stride, padding=1),
+                        torch.nn.GroupNorm(32, 128),
+                        torch.nn.SiLU(),
+                        torch.nn.Conv2d(128, 64, kernel_size=kernel_size, stride=stride, padding=1),
+                        torch.nn.GroupNorm(32, 64),
+                        torch.nn.SiLU(),
+                        torch.nn.Conv2d(64, out_channels, kernel_size=1, stride=1)
+                    )
+                elif cond_type == "latents":
+                    # TBD for latents, the below is a placeholder
+                    self.sapiens_projections[cond_type] = torch.nn.Sequential(
+                        torch.nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=1)
+                    )
 
     def init_from_ckpt(
         self,
@@ -365,7 +384,7 @@ class DiffusionEngine(pl.LightningModule):
                     else:
                         # For depth/segmentation, scale down to match typical latent scale
                         # GroupNorm outputs are roughly normalized, so scale to match latent range
-                        projected = projected.view(B, T, -1, H//8, W//8)
+                        projected = projected.view(B, T, -1, H//8, W//8) # hardcoded
                     sapiens_projected.append(projected)
         
         # Concatenate all projected sapiens conditionals
