@@ -28,6 +28,7 @@ class ArcFaceHead(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.num_images = num_images
 
         self.pooling = nn.AdaptiveAvgPool2d((1, 1))
         self.norm = nn.LayerNorm(in_channels)
@@ -42,7 +43,7 @@ class ArcFaceHead(nn.Module):
         x = x.flatten(start_dim=1, end_dim=3)
         x = self.norm(x)
         x = self.proj(x)
-        x = x.reshape(-1, num_images, self.out_channels) # ! 8 hardcoded for now
+        x = x.reshape(-1, self.num_images, self.out_channels) # ! 8 hardcoded for now
         return x
 
 

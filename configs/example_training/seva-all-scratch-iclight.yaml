@@ -54,7 +54,7 @@ model:
               ckpt_path: null
               use_ip_adapter: True
               face_context_dim: 512 # This is the *input* dim to the projector
-              use_id_head: False
+              use_id_head: True 
         self_attn_rank: 256
         cross_attn_rank: 512
         alpha: 64.0
@@ -140,7 +140,7 @@ data:
   params:
     root_dir: /workspace/datasetvol/mvhuman_data/mv_captures
     batch_size: 2
-    num_workers: 4
+    num_workers: 2
     num_images: 8
     step_size: 60
     only_include: 100001-100490
@@ -175,7 +175,7 @@ lightning:
       params:
         disabled: false
         enable_autocast: false
-        batch_frequency: 1000
+        batch_frequency: 3
         max_images: 8
         increase_log_steps: false
         log_first_step: false

@@ -1,9 +1,9 @@
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_SOCKET_IFNAME=lo
 python main.py \
---base configs/example_training/gen-seva-infu-identity.yaml \
+--base configs/example_training/seva-all-scratch-iclight.yaml \
 --projectname seva-on-mvhsamples \
 --no-test \
---resume /workspace/stonevol2/logs/old_only_faceweight/checkpoints/epoch\=000117.ckpt \
+--resume_from_checkpoint /workspace/stonevol2/logs/old/old_only_faceweight/checkpoints/epoch\=000117.ckpt \
 --no-strict-loading \
 --override_ngpu 0,
