@@ -315,6 +315,7 @@ class DiffusionEngine(pl.LightningModule):
                 )
                 all_out.append(out)
         out = torch.cat(all_out, dim=0)
+        del all_out
         return out
 
     @torch.no_grad()
@@ -335,7 +336,7 @@ class DiffusionEngine(pl.LightningModule):
     def forward(self, x, batch):
         loss = self.loss_fn(self.model, self.denoiser, self.conditioner, x, batch)
         loss_mean = loss.mean()
-        loss_dict = {"loss": loss_mean}
+        loss_dict = {"loss": loss_mean.detach()}
         return loss_mean, loss_dict
 
     def _prepare_batch(self, batch: Dict):
@@ -390,6 +391,7 @@ class DiffusionEngine(pl.LightningModule):
         # Concatenate all projected sapiens conditionals
         if sapiens_projected:
             sapiens_concat = torch.cat(sapiens_projected, dim=2)  # (B, T, sum(C_out), H, W)
+            sapiens_concat[~batch["mask"]] = 0  # target frames should be zero
         else:
             sapiens_concat = None
 
@@ -412,6 +414,7 @@ class DiffusionEngine(pl.LightningModule):
             ], dim=2),
             "concat": torch.cat(concat_list, dim=2)
         }) # concat to be (B, T, 6(plucker) + 2(masks) + 4(ic))
+        del concat_list
         return x, batch
 
     def _encode_inconsistent_images(
