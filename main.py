@@ -695,12 +695,12 @@ class ImageLogger(Callback):
                 for i, img in enumerate(images[k]):
                     # Determine border color based on image key or index
                     
-                    if input_mask[i]: # inputs
+                    if input_mask[i].item(): # inputs
                         border_color = (247.0, 121.0, 132.0)  # red
                     else: # targets
                         border_color = (101.0, 174.0, 219.0)  # blue
                     # if ref image, then should be green
-                    if ref_mask[i]:
+                    if ref_mask[i].item():
                         border_color = (0.0, 255.0, 0.0) # green
 
                     img = self.denormalize_image(self.tensor_to_image(img)) # (-1, 1) ->(0, 1)
@@ -868,6 +868,7 @@ class ImageLogger(Callback):
                         batch_latents.append(pl_module.encode_first_stage(b)) # scales automatically
                     x = torch.stack(batch_latents, dim=0)
                     batch["clean_latent"] = x
+                    del batch_latents
                 else: #latents already precomputed (same as "IdentityEncoder")
                     batch["clean_latent"] = x * pl_module.scale_factor # need to scale!
 
@@ -891,6 +892,7 @@ class ImageLogger(Callback):
                 if "sapiens_conditioning" in batch and batch["sapiens_conditioning"] is not None:
                     for cond_type, cond_tensor in batch["sapiens_conditioning"].items():
                         if cond_type in pl_module.sapiens_projections:
+                            cond_tensor = cond_tensor[:N]
                             # cond_tensor shape: (B, T, C, H, W)
                             B, T, C, H, W = cond_tensor.shape
                             # Reshape to (B*T, C, H, W) for conv2d
@@ -997,9 +999,9 @@ class ImageLogger(Callback):
 
                 pre_images = {} # legacy name
                 pre_images["inputs"] = gt_images
-                pre_images["reconstructions"] = z
+                pre_images["reconstructions"] = z.detach().cpu()
                 if sample:
-                    pre_images["samples"] = samples
+                    pre_images["samples"] = samples.detach().cpu()
 
                 face_bbox = batch.get("face_bbox")
                 if face_bbox is not None:
@@ -1060,6 +1062,17 @@ class ImageLogger(Callback):
                     pl_module.global_step, pl_module.current_epoch, batch_idx, pl_module.logger, pl_module.scale_factor,
                     face_bbox=face_bbox
                 )
+
+                # Explicitly delete all GPU tensors to free memory
+                del x, z, ic
+                if "sapiens_projected" in locals():
+                    del sapiens_projected
+                if "sapiens_concat" in locals():
+                    del sapiens_concat
+                if "c" in locals():
+                    del c
+                if "uc" in locals():
+                    del uc      
             
 
             # for k in images: # images is dict{inputs, reconstructions, samples} (as in diffusion.py)
