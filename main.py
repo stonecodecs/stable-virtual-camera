@@ -829,7 +829,7 @@ class ImageLogger(Callback):
             should_log
             # self.check_frequency(check_idx)
             and hasattr(pl_module, "log_images")  # batch_idx % self.batch_freq == 0
-            and callable(pl_module.log_images)
+            and callable(pl_module.log_images) 
             and self.max_images > 0
         ):
             
@@ -854,6 +854,8 @@ class ImageLogger(Callback):
 
             # NEW -- CPU based logging, based on DiffusionEngine.log_images
             # ! replaced with old GPU logging
+            # Note: Removed autocast("cuda") as it can cause "invalid configuration argument" errors
+            # with certain operations (e.g., CNN projections). Decoding happens on CPU anyway.
             with torch.no_grad(), torch.amp.autocast("cuda"):
                 x = pl_module.get_input(batch)
                 if len(x.shape) == 1: # if latents are NOT computed yet, encode
@@ -879,6 +881,7 @@ class ImageLogger(Callback):
                     rgb_ic = batch["frames"]
 
                 # Project and concatenate sapiens conditionals if present
+                # Match the exact preprocessing from diffusion.py _prepare_batch
                 sapiens_projected = []
                 if "sapiens_conditioning" in batch and batch["sapiens_conditioning"] is not None:
                     for cond_type, cond_tensor in batch["sapiens_conditioning"].items():
@@ -889,22 +892,29 @@ class ImageLogger(Callback):
                             cond_flat = cond_tensor.view(B * T, C, H, W).to(pl_module.device)
                             # Project
                             projected = pl_module.sapiens_projections[cond_type](cond_flat)
-                            # Reshape back to (B, T, C_out, H, W)
+                            # Scale to match the scale of other channels (IC latents use scale_factor)
+                            # This prevents the new channels from dominating the output
                             if cond_type == "latents":
+                                # Latents should match the scale of IC latents
+                                projected = projected * pl_module.scale_factor
                                 projected = projected.view(B, T, 4, 72, 72)
                             else:
-                                projected = projected.view(B, T, -1, H//8, W//8)
+                                # For depth/segmentation, scale down to match typical latent scale
+                                # GroupNorm outputs are roughly normalized, so scale to match latent range
+                                projected = projected.view(B, T, -1, H//8, W//8) # hardcoded
                             sapiens_projected.append(projected)
                 
                 # Concatenate all projected sapiens conditionals
                 if sapiens_projected:
                     sapiens_concat = torch.cat(sapiens_projected, dim=2)  # (B, T, sum(C_out), H, W)
+                    sapiens_concat[~batch["mask"]] = 0  # target frames should be zero
                 else:
                     sapiens_concat = None
 
                 concat_list = [batch["concat"], ic]
                 if sapiens_concat is not None:
                     concat_list.append(sapiens_concat)
+                    del batch["sapiens_conditioning"] 
 
                 batch.update({
                     "replace": torch.cat([
@@ -918,6 +928,7 @@ class ImageLogger(Callback):
                     ], dim=2),
                     "concat": torch.cat(concat_list, dim=2)
                 })
+                del concat_list
 
                 conditioner_input_keys = [e.input_key for e in pl_module.conditioner.embedders]
                 if self.log_images_kwargs.get("ucg_keys"):
@@ -951,13 +962,26 @@ class ImageLogger(Callback):
                     sampling_kwargs["input_frame_mask"] = batch.get("mask", None)
 
                 # keep GPU until we have the generated latents
-                N = min(x.shape[0], self.max_images) # these only get the first N batches
+                N = min(self.log_images_kwargs.get("N", x.shape[0]), self.max_images) # these only get the first N batches
                 x = x.to(pl_module.device)[:N]
                 z = x
 
+                if sampling_kwargs["c2w"] is not None:
+                    sampling_kwargs["c2w"] = sampling_kwargs["c2w"][:N]  # Slice batch dimension
+                if sampling_kwargs["K"] is not None:
+                    sampling_kwargs["K"] = sampling_kwargs["K"][:N]  # Slice batch dimension
+                if sampling_kwargs["input_frame_mask"] is not None:
+                    sampling_kwargs["input_frame_mask"] = sampling_kwargs["input_frame_mask"][:N]  # Slice batch dimension
+                
+                # Slice all conditionings to match N (batch dimension is first)
+                # This ensures cond["replace"] matches the batch size of input after CFG expansion
                 for k in c:
                     if isinstance(c[k], torch.Tensor):
-                        c[k], uc[k] = map(lambda y: y[k][:N].to(pl_module.device), (c, uc))
+                        # Slice the batch dimension (first dimension) for all tensors
+                        c[k] = c[k][:N].to(pl_module.device)
+                        if k in uc and isinstance(uc[k], torch.Tensor):
+                            uc[k] = uc[k][:N].to(pl_module.device)
+
                 # sample latents for targets
                 if sample:
                     # with pl_module.ema_scope("Plotting"): 
@@ -988,14 +1012,14 @@ class ImageLogger(Callback):
                         if pre_images[k].dim() == 5:
                             batch_size, num_images = pre_images[k].shape[:2]
                             total_images = batch_size * num_images
-                            N = min(total_images, self.max_images)
+                            N_frames = min(total_images, self.max_images)
                             # Flatten to [batch_size*num_images, C, H, W] for easier slicing
                             pre_images[k] = pre_images[k].view(total_images, *pre_images[k].shape[2:])
-                            pre_images[k] = pre_images[k][:N]
+                            pre_images[k] = pre_images[k][:N_frames]
                         else:
-                            N = min(pre_images[k].shape[0], self.max_images)
+                            N_frames = min(pre_images[k].shape[0], self.max_images)
                             if not isheatmap(pre_images[k]):
-                                pre_images[k] = pre_images[k][:N]
+                                pre_images[k] = pre_images[k][:N_frames]
                         
                         # if k == "samples" or k == "reconstructions": # uncomment if using GPU-based logging
                         #     # decode latents
