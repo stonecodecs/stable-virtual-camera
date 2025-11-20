@@ -666,8 +666,8 @@ class ImageLogger(Callback):
         # pl_module: Union[None, pl.LightningModule] = None,
     ):
         root = os.path.join(save_dir, "images", split)
-        ref_mask   = masks[0]
-        input_mask = masks[1]
+        ref_mask   = masks[0].reshape(-1)
+        input_mask = masks[1].reshape(-1)
         components_for_diffmap = []
         for k in images:
             if isheatmap(images[k]):
@@ -858,8 +858,11 @@ class ImageLogger(Callback):
             # with certain operations (e.g., CNN projections). Decoding happens on CPU anyway.
             with torch.no_grad(), torch.amp.autocast("cuda"):
                 x = pl_module.get_input(batch)
+                N = self.log_images_kwargs.get("N", x.shape[0]) # these only get the first N batches
+                
                 if len(x.shape) == 1: # if latents are NOT computed yet, encode
-                    x = batch["frames"].to(pl_module.device)
+                    x = batch["frames"][:N].to(pl_module.device)
+                    
                     batch_latents = []
                     for b in x:
                         batch_latents.append(pl_module.encode_first_stage(b)) # scales automatically
@@ -870,15 +873,17 @@ class ImageLogger(Callback):
 
                 # encode ic latents from the paths (scales)
                 if torch.any(batch["use_inconsistent"]).item():
-                    ic = pl_module._encode_inconsistent_images(batch["ic_rgb"], batch["ref_mask"], batch["clean_latent"])
+                    ic = pl_module._encode_inconsistent_images(batch["ic_rgb"][:N], batch["ref_mask"][:N], batch["clean_latent"][:N])
                     # for target (not input/ref) frames, zero condition latents
-                    ic[~batch["mask"]] = 0
-                    rgb_ic = batch["ic_rgb"]
+                    ic[~batch["mask"][:N]] = 0
+                    rgb_ic = batch["ic_rgb"][:N]
                 else:
                     # no conditioning (to be replaced by clean_latents for inputs)
                     ic = torch.zeros_like(batch["clean_latent"], device=pl_module.device)
-                    ic[batch["ref_mask"]] = batch["clean_latent"][batch["ref_mask"]]
+                    ic[batch["ref_mask"][:N]] = batch["clean_latent"][batch["ref_mask"][:N]]
                     rgb_ic = batch["frames"]
+
+                z = x
 
                 # Project and concatenate sapiens conditionals if present
                 # Match the exact preprocessing from diffusion.py _prepare_batch
@@ -907,20 +912,20 @@ class ImageLogger(Callback):
                 # Concatenate all projected sapiens conditionals
                 if sapiens_projected:
                     sapiens_concat = torch.cat(sapiens_projected, dim=2)  # (B, T, sum(C_out), H, W)
-                    sapiens_concat[~batch["mask"]] = 0  # target frames should be zero
+                    sapiens_concat[~batch["mask"][:N]] = 0  # target frames should be zero
                 else:
                     sapiens_concat = None
 
-                concat_list = [batch["concat"], ic]
+                concat_list = [batch["concat"][:N], ic]
                 if sapiens_concat is not None:
                     concat_list.append(sapiens_concat)
                     del batch["sapiens_conditioning"] 
 
                 batch.update({
                     "replace": torch.cat([
-                        batch["clean_latent"],
+                        batch["clean_latent"][:N],
                         repeat(
-                            batch["ref_mask"],
+                            batch["ref_mask"][:N],
                             "b n -> b n 1 h w",
                             h=batch["plucker"].shape[-2],
                             w=batch["plucker"].shape[-1]
@@ -960,11 +965,6 @@ class ImageLogger(Callback):
                     sampling_kwargs["c2w"] = batch.get("c2w", None)
                     sampling_kwargs["K"] = batch.get("K", None)
                     sampling_kwargs["input_frame_mask"] = batch.get("mask", None)
-
-                # keep GPU until we have the generated latents
-                N = min(self.log_images_kwargs.get("N", x.shape[0]), self.max_images) # these only get the first N batches
-                x = x.to(pl_module.device)[:N]
-                z = x
 
                 if sampling_kwargs["c2w"] is not None:
                     sampling_kwargs["c2w"] = sampling_kwargs["c2w"][:N]  # Slice batch dimension
@@ -1032,8 +1032,8 @@ class ImageLogger(Callback):
 
                 masks = []
                 # masks = batch["mask"] # (B, max_images) binary boolean tensor
-                masks.append(batch["ref_mask"].reshape(-1)[:N].detach().cpu()) # (B, max_images) binary boolean tensor
-                masks.append(batch["mask"].reshape(-1)[:N].detach().cpu()) # (B, max_images) binary boolean tensor
+                masks.append(batch["ref_mask"][:N].detach().cpu()) # (B, max_images) binary boolean tensor
+                masks.append(batch["mask"][:N].detach().cpu()) # (B, max_images) binary boolean tensor
 
                 if is_train: # if was training previously, set it back
                     # this shouldn't interfere, since the VAE is frozen anyways
