@@ -740,7 +740,7 @@ class MVHumanNetDataset(Dataset):
         return ic_rgb, ic_paths
 
     def _crop_and_transform_frames_and_intrinsics(
-        self, frames_info, frames, ic_rgb, subject_id, cam_order, intrinsics, ref_mask, sapiens_conditionings):
+        self, frames_info, frames, ic_rgb, subject_id, cam_order, intrinsics, ref_mask, ic_masks, sapiens_conditionings):
         """
         Crop and transform frames while updating intrinsics as needed.
         Args:
@@ -819,7 +819,7 @@ class MVHumanNetDataset(Dataset):
             frames = [self.transform(frame) for frame in frames]
             frames = torch.stack(frames, dim=0)
             ic_rgb_tensor = torch.zeros((self.num_images, 3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
-            for i, (ic_image, bbox) in enumerate(zip(ic_rgb, rel_bbox)):
+            for i, (ic_image, bbox, is_ref, is_iclight, is_infu) in enumerate(zip(ic_rgb, rel_bbox, ref_mask, ic_masks['iclight'], ic_masks['infu'])):
                 # First resize ic_image to target shape
                 ic_image = torch.nn.functional.interpolate(ic_image.unsqueeze(0), size=(self.target_shape[0], self.target_shape[1]), mode='bilinear', align_corners=False).squeeze(0)
                 dx1, dy1, dx2, dy2 = bbox.int()
@@ -850,11 +850,13 @@ class MVHumanNetDataset(Dataset):
                             cropped = padded_img[:, bbox[1]:bbox[3], bbox[0]:bbox[2]]
                             sapiens_conditionings[cond][ref_idx] = T.Resize((self.target_shape[0], self.target_shape[1]))(cropped)
                         else:
-                            # if IClight/InfU
-                            cropped_cond_tensor = cond_tensor[:, 0+dy1:self.target_shape[0]+dy2, 0+dx1:self.target_shape[1]+dx2]
+                            # if IClight/InfU, crop and resize (but NO normalize)
+                            scale = cond_tensor.shape[-2] / self.target_shape[0]
+                            cropped_cond_tensor = cond_tensor[:, 0+int(dy1*scale):int((self.target_shape[0]+dy2)*scale), 0+int(dx1*scale):int((self.target_shape[1]+dx2)*scale)]
                             sapiens_conditionings[cond][i] = T.Resize((self.target_shape[0], self.target_shape[1]))(cropped_cond_tensor)
                         if cond == "seg_masks":
                             sapiens_conditionings[cond][i] = one_hot_encode_segmentation(sapiens_conditionings[cond][i], 28)
+
             sapiens_conditionings = {cond: torch.stack(cond_tensor, dim=0) for cond, cond_tensor in sapiens_conditionings.items()}
             ic_rgb = ic_rgb_tensor
         else: # center crop + resize only (NOTE: set transform=None for this default behavior)
@@ -1004,7 +1006,7 @@ class MVHumanNetDataset(Dataset):
         frames, ic_rgb, Ks, sapiens_conditionings, face_bboxes_adjusted = self._crop_and_transform_frames_and_intrinsics(
             frames_info, frames, ic_rgb,
             subject_id, cam_order, intrinsics,
-            ref_mask, sapiens_conditionings
+            ref_mask, ic_masks, sapiens_conditionings
         )
 
         # this will always be constant 1-tensor (according to pretrained model authors)
