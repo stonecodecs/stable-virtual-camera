@@ -106,13 +106,14 @@ class RandomBBoxCropper(object):
 
             x_offset = torch.clamp(
                 torch.randn(B,1) * center_std[:,0].view(-1,1) + center_mean[:,0].view(-1,1),
-                min=(x1 + size_sample_int // 2 + self.padding[0]).view(-1, 1),
-                max=(x2 - size_sample_int // 2 - self.padding[2]).view(-1, 1)
+                min=(x1 + size_sample_int // 2).view(-1, 1),
+                max=(x2 - size_sample_int // 2).view(-1, 1)
             )
             y_offset = torch.clamp(
-                torch.randn(B,1) * center_std[:,1].view(-1,1) + center_mean[:,1].view(-1,1) - 200, 
-                min=(y1 + size_sample_int // 2 + self.padding[1]).view(-1, 1),
-                max=(y2 - size_sample_int // 2 - self.padding[3]).view(-1, 1)
+                # ! -200 is HARDCODED to get the face
+                torch.randn(B,1) * center_std[:,1].view(-1,1) + center_mean[:,1].view(-1,1) - 200,
+                min=(y1 + size_sample_int // 2).view(-1, 1),
+                max=(y2 - size_sample_int // 2).view(-1, 1)
             )
 
             # random crop
@@ -141,7 +142,7 @@ class RandomBBoxCropper(object):
             padding_mode=True
         )
 
-        scale = 576.0 / bbox_max_dim
+        scale = 576.0 / (bbox_max_dim + self.padding[0] + self.padding[2])
         rel_bbox = (rel_bbox * scale.view(-1, 1)).int()
 
         return {

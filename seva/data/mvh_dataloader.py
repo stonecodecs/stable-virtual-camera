@@ -208,7 +208,7 @@ class MVHumanNetDataset(Dataset):
         self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
         self.fixed_sampling_ids = fixed_sampling_ids
         self.adjacent_frame_sampling_prob = 0.2 # Trajectory NVS acceptance rate
-        self.all_inputs_prob = 0.8
+        self.all_inputs_prob = 0.85
         self.white_background = white_background
         self.preload_path = preload_path
         self.iclight_dataset_path = iclight_dataset_path # IC-light output directory
@@ -638,7 +638,7 @@ class MVHumanNetDataset(Dataset):
 
         return sampled_image_paths, sampled_image_mask_paths, camera_order, images_permutation
 
-    def _sample_all_masks(self):
+    def _sample_all_masks(self, use_iclight: bool = False, use_infu: bool = False):
         # * Sample input/target frame split
         if not self.use_inconsistent:
             num_input_frames = np.random.randint(1, self.num_images) # at least 1 input frame
@@ -670,13 +670,22 @@ class MVHumanNetDataset(Dataset):
         if self.use_inconsistent:
             # based on the input/target mask (only inputs can be sampled)
             # ic_sampling_prob is the probabiilty of sampling from IC-light over InfU
-            ic_masks['iclight'] = torch.rand(self.num_images) < self.ic_sampling_prob
-            ic_masks['infu'] = ~ic_masks['iclight']
-            # zero-out target frames (these should not have any conditioning)
-            ic_masks['iclight'] = ic_masks['iclight'] * input_target_mask
-            ic_masks['infu'] = ic_masks['infu'] * input_target_mask
-            ic_masks['iclight'][ref_mask] = False
-            ic_masks['infu'][ref_mask] = False
+            if use_iclight and use_infu:
+                ic_masks['iclight'] = torch.rand(self.num_images) < self.ic_sampling_prob
+                ic_masks['infu'] = ~ic_masks['iclight']
+                # zero-out target frames (these should not have any conditioning)
+                ic_masks['iclight'] = ic_masks['iclight'] * input_target_mask
+                ic_masks['infu'] = ic_masks['infu'] * input_target_mask
+                ic_masks['iclight'][ref_mask] = False
+                ic_masks['infu'][ref_mask] = False
+            elif use_iclight and not use_infu:
+                ic_masks['iclight'] = ~ref_mask * input_target_mask
+                ic_masks['infu'] = torch.zeros(self.num_images, dtype=torch.bool)
+            elif not use_iclight and use_infu:
+                ic_masks['iclight'] = torch.zeros(self.num_images, dtype=torch.bool)
+                ic_masks['infu'] = ~ref_mask * input_target_mask
+            else:
+                raise ValueError(f"use_inconsistent is True, but neither iclight or infu paths are provided!")
         else:
             # zero masks indicating no inconsistent frames
             ic_masks['iclight'] = torch.zeros(self.num_images, dtype=torch.bool)
@@ -707,7 +716,7 @@ class MVHumanNetDataset(Dataset):
         ic_paths = []
         # Pre-sample unique InfU indices to avoid duplicates
         num_infu_frames = ic_masks['infu'].sum().item() if isinstance(ic_masks['infu'], torch.Tensor) else ic_masks['infu'].sum()
-        if num_infu_frames > 0:
+        if ic_masks['infu'].sum() > 0 and num_infu_frames > 0:
             infu_num_images_in_directory = self.infu_num_images[subject_id]
             # Sample exactly as many unique indices as we need
             num_samples = min(num_infu_frames, infu_num_images_in_directory)
@@ -835,7 +844,7 @@ class MVHumanNetDataset(Dataset):
                         cond_tensor = sapiens_conditionings[cond][i]
                         if ref_idx == i:
                             # if MVHN, crop using new_bbox 
-                            padded_img, bbox = self.cropper._possibly_pad_img(
+                            padded_img, refbbox = self.cropper._possibly_pad_img(
                                 cond_tensor.unsqueeze(0), 
                                 new_bbox[ref_idx][0].unsqueeze(0), 
                                 new_bbox[ref_idx][1].unsqueeze(0), 
@@ -846,8 +855,8 @@ class MVHumanNetDataset(Dataset):
                                 padded_img = padded_img[0]
                             else:
                                 padded_img = padded_img.squeeze(0)
-                            bbox = bbox.squeeze(0)
-                            cropped = padded_img[:, bbox[1]:bbox[3], bbox[0]:bbox[2]]
+                            refbbox = refbbox.squeeze(0).int()
+                            cropped = padded_img[:, refbbox[1]:refbbox[3], refbbox[0]:refbbox[2]]
                             sapiens_conditionings[cond][ref_idx] = T.Resize((self.target_shape[0], self.target_shape[1]))(cropped)
                         else:
                             # if IClight/InfU, crop and resize (but NO normalize)
@@ -979,7 +988,10 @@ class MVHumanNetDataset(Dataset):
         img_paths, img_mask_paths, cam_order, sample_permutation = self._sample_multiview_image_paths(frames_info)
         
         # generate masks for input/target frames split, reference frame, and IC/InfU frames
-        input_target_mask, ref_mask, ic_masks = self._sample_all_masks()
+        input_target_mask, ref_mask, ic_masks = self._sample_all_masks(
+            use_iclight=self.iclight_dataset_path is not None,
+            use_infu=self.infu_dataset_path is not None,
+        )
         iclight_mask = ic_masks["iclight"]
         infu_mask = ic_masks["infu"]
 
