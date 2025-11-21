@@ -160,7 +160,7 @@ class MVHumanNetDataset(Dataset):
         num_images,
         latents_dir=None,
         transforms=None,
-        pre_scale=0.5,
+        pre_scale_intrinsics=0.5,
         data_limit=None,
         only_include=None,
         exclude=None,
@@ -185,7 +185,7 @@ class MVHumanNetDataset(Dataset):
         self.latents_dir = latents_dir       # directory of all latents
         self.num_images = num_images         # context window T
         self.transforms = transforms         # transforms for the random crop
-        self.pre_scale = pre_scale           # since MVHumanNet is downsampled, update intrinsics
+        self.pre_scale_intrinsics = pre_scale_intrinsics           # since MVHumanNet is downsampled, update intrinsics
         self.only_include = set(only_include) if only_include is not None else None     # TEMP -- include only these subjects (as List of strings)
         self.exclude = set(exclude) if exclude is not None else None               # TEMP -- exclude these subjects (as List of strings)
         self.data_limit = data_limit         # TEMP -- only get the first 'data_limit' (int) subjects
@@ -266,8 +266,8 @@ class MVHumanNetDataset(Dataset):
                 T.Normalize([0.5], [0.5])
             ])
 
-        if self.pre_scale != 0.5:
-            print("WARNING: pre_scale is not 0.5, which is expected for MVHumanNet!")
+        if self.pre_scale_intrinsics != 0.5:
+            print("WARNING: pre_scale_intrinsics is not 0.5, which is expected for MVHumanNet!")
         print("MVHN::init done!")
 
 
@@ -437,7 +437,8 @@ class MVHumanNetDataset(Dataset):
         print("Loading preloaded filepaths completed!")
         return scenes
 
-
+    #! DEPRECATED: online reading of the dataset takes many hours per run just to load!
+    #! therefore, only use preloaded filepaths.
     def _load_scenes(self):
         """
         NEW -- compact loading using priors:
@@ -548,7 +549,7 @@ class MVHumanNetDataset(Dataset):
     def _get_iclight_path(self, subject_id, timestep, camera):
         if self.iclight_dataset_path is None:
             return None
-        return self.iclight_dataset_path + f"/{subject_id}/{camera}/{timestep}_img.png"
+        return self.iclight_dataset_path + f"/{subject_id}/images_lr/{camera}/{timestep}_img.png"
 
     def _sapiens_get(self, cond, subject_id, camera, timestep, dataset_type="mvhn"):
         try:
@@ -568,33 +569,53 @@ class MVHumanNetDataset(Dataset):
             print(f"Error loading sapiens conditioning: {e}")
             return None
 
-    def __len__(self):
-        return len(self.scenes)
-    
-    def __getitem__(self, idx):
-        # TODO - simplify by offloading some functionality to a class or something
-        scene = self.scenes[idx]
-        subject_id = scene['subject_id'] # ex. 100001
-        timestep = scene['timestep'] # ex. 0005
-        frames_info = dict(sorted(scene['frames_info'].items())) # camera dict
-        subject_path = os.path.join(self.root_dir, subject_id)
+    def _load_raw_frames(self, image_paths, mask_paths):
+        """
+        Load multi-view frames from a list of 'image_paths' and their corresponding 'mask_paths'
+        Returns a tensor of shape (num_images, 3, image_shape[0], image_shape[1]).
 
-        # get camera parameters
-        extrinsics = self.cam_params[subject_id]['extrinsics']
-        intrinsics = np.array(self.cam_params[subject_id]['intrinsics'])
-        camera_scale = self.cam_params[subject_id]['camera_scale'] 
+        Note: these are raw images straight from the dataset.
+        No transform is applied except if needing to resize to expected input shape.
+        """
+        frames = torch.zeros((self.num_images, 3, self.image_shape[0],  self.image_shape[1]))
+        for i, (img_path, mask_path) in enumerate(zip(image_paths, mask_paths)):
+            image = Image.open(img_path).convert("RGB")
+            img_mask = Image.open(mask_path)
 
-        if self.pre_scale != 1: # update intrinsics (required for MVHumanNet default 0.5x prescaling)
-            intrinsics = update_intrinsics_resize(intrinsics, scale=self.pre_scale)
+            if img_mask.size != image.size: # ensure matching size! (note: subject 100681 has different sizes!)
+                image = image.resize(img_mask.size, Image.BILINEAR)
 
-        # Sample frames indices
+            # Create masked image by compositing with black background
+            background = Image.new(
+                'RGB', image.size, (255, 255, 255) if self.white_background else (0, 0, 0)
+            )
+
+            masked_image = Image.composite(image, background, img_mask)
+            frames[i] = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])(masked_image)
+            del image, img_mask, masked_image # free PIL images
+        return frames
+
+    def _sample_multiview_image_paths(self, frames_info: dict, use_iclight: bool = False, use_infu: bool = False) -> Tuple[list[str], list[str], list[str]]:
+        """
+        Sample multi-view frame + subject mask indices (as string paths) from a frames_info dictionary.
+        Returns the sampled images, masks, and camera order.
+        Args:
+            frames_info: dictionary of frames_info for a subject
+            use_iclight: whether to use IC-light
+            use_infu: whether to use InfU
+        Returns:
+            sampled_image_paths: list of sampled image paths
+            sampled_image_mask_paths: list of sampled image mask paths
+            camera_order: list of camera order
+            images_permutation: permutation used to select these subsets
+        """
+        # Sample multi-view frame + subject mask indices (as string paths)
         camera_order = [cam for cam in list(frames_info.keys())] # 48 sorted camera IDs
         sampled_image_paths = [frames_info[cam]['image_path'] for cam in camera_order]
         sampled_image_mask_paths = [frames_info[cam]['mask_path'] for cam in camera_order]
 
         # NOTE: if num_images>16, then trajectory NVS will default to using all in rung
         if np.random.rand() <= self.adjacent_frame_sampling_prob: # for trajectory NVS
-            # print("trajectory NVS")
             # choose which rung of cameras to sample from (top/mid/bot)
             # this is only because these paths are the most apparently continuous
             which_rung = np.random.randint(0, len(CAMERA_RUNGS))
@@ -603,206 +624,133 @@ class MVHumanNetDataset(Dataset):
             images_permutation = np.roll(np.arange(len(rung_of_cameras)), -start_idx)[:self.num_images]
             images_permutation = [CAMERA_TO_INDEX[rung_of_cameras[i]] for i in images_permutation]
         else: # for set NVS
-            # sample random indices
-            # print("set NVS")
+            # simply uniform sampling of all views
             images_permutation = np.random.choice(len(sampled_image_paths), self.num_images, replace=False)
 
-        if self.fixed_sampling_ids is not None: # overwrite images_permutation
+        # (NOTE: mainly for debugging: overwrites selected samples to a fixed user-defined set)
+        if self.fixed_sampling_ids is not None:
             images_permutation = self.fixed_sampling_ids
 
-        camera_order = [camera_order[i] for i in images_permutation] # ordered subset of 'num_images' sampled cameras
+        # Select subset of multi-view frames (num_images) from the full set of cameras
+        camera_order = [camera_order[i] for i in images_permutation] # ordered subset
         sampled_image_paths = [sampled_image_paths[i] for i in images_permutation]
         sampled_image_mask_paths = [sampled_image_mask_paths[i] for i in images_permutation]
 
-        # Load MVHN frames from image paths
-        # (T,3,H',W'), this will be scaled later to 'target_shape'
-        frames = torch.zeros((self.num_images, 3, self.image_shape[0],  self.image_shape[1]))
-        for i, (img_path, mask_path) in enumerate(zip(sampled_image_paths, sampled_image_mask_paths)):
-            image = Image.open(img_path).convert("RGB")
-            img_mask = Image.open(mask_path)
+        return sampled_image_paths, sampled_image_mask_paths, camera_order, images_permutation
 
-            if img_mask.size != image.size: # ensure matching size! (note: 100681 has different sizes!)
-                image = image.resize(img_mask.size, Image.BILINEAR)
-
-            # Create masked image by compositing with black background
-            if self.white_background:
-                background = Image.new('RGB', image.size, (255, 255, 255))
-            else: # black
-                background = Image.new('RGB', image.size, (0, 0, 0))
-
-            masked_image = Image.composite(image, background, img_mask)
-            # Apply transforms after masking
-            # NOTE: if using non-cropped latents, then transforms is just the default as in @dataset.py
-            # masked_image = self.transform(masked_image) # ! moved transform to after random crop
-            frames[i] = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])(masked_image)
-            del image, img_mask, masked_image
-
-        # Sample input/target frame split
+    def _sample_all_masks(self):
+        # * Sample input/target frame split
         if not self.use_inconsistent:
             num_input_frames = np.random.randint(1, self.num_images) # at least 1 input frame
         else:
-            # NOTE: if use_ic, then we make it higher probability that all num_images are inputs
-            # meaning that input_frames_mask will be all 1, and ref_maks will be one-hot
-            # if input_frames_mask is 0 at any point (not max num_images case), then these will have no ic cond.
+            # using IC, make it higher probability that all num_images are inputs
             if np.random.rand() <= self.all_inputs_prob:
-                # more likely to have all inconsistent inputs (then reconstruct to target)
+                # more likely to have all inputs (inconsistent images)
                 num_input_frames = self.num_images
-            else: # 20% chance to have some ic inputs and then new targets
-                num_input_frames = np.random.randint(1, self.num_images) # at least 1 input frame
-        
-        input_frames_indices = np.random.choice(self.num_images, num_input_frames, replace=False) 
+            else:
+                # otherwise, target views without IC are to be predicted (>=1 input frames)
+                num_input_frames = np.random.randint(1, self.num_images)
 
-        # Create input/target masks (1: input/ 0: target)
-        input_frames_mask = torch.zeros(self.num_images, dtype=torch.bool)
-        input_frames_mask[input_frames_indices] = True
+        input_frames_indices = np.random.choice(self.num_images, num_input_frames, replace=False)
+        input_target_mask = torch.zeros(self.num_images, dtype=torch.bool)
+        input_target_mask[input_frames_indices] = True # 1: input, 0: target
 
-        if not self.use_inconsistent: # phase 1
+        # * create ref_mask (one-hot)
+        if not self.use_inconsistent: # not used in our case
             # since inputs are all consistent in dataset, we can use multiple "references"
-            ref_mask = input_frames_mask.clone()
-            self.ref_mask = ref_mask
+            ref_mask = input_target_mask.clone()
         else:
-            # inputs will all be inconsistent, and we can only fix to a "single reference"
+            # inputs will all be inconsistent, and we can only fix to a single reference frame
             ref_mask = torch.zeros(self.num_images, dtype=torch.bool)
             fix_frame_idx = input_frames_indices[np.random.choice(len(input_frames_indices), 1).item()]
             ref_mask[fix_frame_idx] = True # this becomes the fixed frame
-            self.ref_mask = ref_mask
-            # input_frames_mask = ref_mask.clone()
 
-        ic_mask = None  # Initialize ic_mask
-        infu_random_indices = None
-        if self.use_inconsistent and self.iclight_dataset_path is not None:
-            # get ic-light paths (corresponding to selected frame!)
-            ic_paths = [path.replace("mv_captures", "relit_images").replace(".jpg", ".png") for path in sampled_image_paths]
+        # * create masks for inconsistent images from all synthetic sources
+        ic_masks = {}
+        if self.use_inconsistent:
+            # based on the input/target mask (only inputs can be sampled)
+            # ic_sampling_prob is the probabiilty of sampling from IC-light over InfU
+            ic_masks['iclight'] = torch.rand(self.num_images) < self.ic_sampling_prob
+            ic_masks['infu'] = ~ic_masks['iclight']
+            # zero-out target frames (these should not have any conditioning)
+            ic_masks['iclight'] = ic_masks['iclight'] * input_target_mask
+            ic_masks['infu'] = ic_masks['infu'] * input_target_mask
+            ic_masks['iclight'][ref_mask] = False
+            ic_masks['infu'][ref_mask] = False
+        else:
+            # zero masks indicating no inconsistent frames
+            ic_masks['iclight'] = torch.zeros(self.num_images, dtype=torch.bool)
+            ic_masks['infu'] = torch.zeros(self.num_images, dtype=torch.bool)
+        return input_target_mask, ref_mask, ic_masks
 
-            # get infu paths (randomly sampled!)
-            if self.infu_dataset_path is not None and self.ic_sampling_prob > 0:
-                infu_num_images_in_directory = self.infu_num_images[subject_id]
-                infu_random_indices = np.random.choice(infu_num_images_in_directory, self.num_images, replace=False) + 1
-                infu_paths = [self._get_infu_path(subject_id, f"{infu_random_indices[i]:06d}") for i in range(self.num_images)]
- 
-                # use a "mask" to determine which of the ic paths are from ic-light and which are from infu
-                # if True, then using IClight, otherwise InfU
-                ic_mask = torch.rand(self.num_images) <= self.ic_sampling_prob
-                ic_paths = [ic_paths[i] if ic_mask[i] else infu_paths[i] for i in range(self.num_images)]
 
-            ic_rgb = []
-            tensorize = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
-            for ic_path in ic_paths:
+    def _load_inconsistent_frames(
+        self, img_paths, img_mask_paths, cam_order, subject_id, timestep,
+        ref_mask, ic_masks):
+        """
+        Replace the sampled MVHN image paths with inconsistent paths (from IC-light and InfU synthetic data).
+        Args:
+            img_paths: list of sampled image paths
+            img_mask_paths: list of sampled image mask paths
+            cam_order: list of camera order
+            subject_id: subject ID
+            timestep: timestep
+            ref_mask: reference mask
+            ic_masks: dictionary of IC-light and InfU masks
+        Returns:
+            ic_rgb: list of actual model input image data (GT, IC-light, InfU)
+            ic_paths: list of actual filepaths to inconsistent images
+        """
+        if not self.use_inconsistent:
+            return torch.zeros((self.num_images, 3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+
+        ic_paths = []
+        # Pre-sample unique InfU indices to avoid duplicates
+        num_infu_frames = ic_masks['infu'].sum().item() if isinstance(ic_masks['infu'], torch.Tensor) else ic_masks['infu'].sum()
+        if num_infu_frames > 0:
+            infu_num_images_in_directory = self.infu_num_images[subject_id]
+            # Sample exactly as many unique indices as we need
+            num_samples = min(num_infu_frames, infu_num_images_in_directory)
+            infu_indices = list(np.random.choice(infu_num_images_in_directory, num_samples, replace=False) + 1)
+        else:
+            infu_indices = []
+        
+        # NOTE: these images are of different sizes/shapes!
+        for path, is_iclight, is_infu, is_ref, camera in zip(img_paths, ic_masks['iclight'], ic_masks['infu'], ref_mask, cam_order):
+            if is_ref:
+                ic_path = path # GT frame
+            elif is_iclight:
+                ic_path = self._get_iclight_path(subject_id, timestep, camera)
+            elif is_infu:
+                # timestep is treated differently for InfU as a random index
+                infu_random_index = infu_indices.pop(0)
+                ic_path = self._get_infu_path(subject_id, f"{infu_random_index:06d}")
+            else: # target frame (no inconsistent frame)
+                ic_path = None
+            ic_paths.append(ic_path)
+
+        ic_rgb = []
+        tensorize = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
+        for ic_path in ic_paths:
+            if ic_path is not None:
                 ic_image = Image.open(ic_path).convert("RGB")
                 ic_rgb.append(tensorize(ic_image)) # these can be different image shapes originally
-            # ! NOTE: only works with IC-light; need to combine with InfU later (combine in filesystem or sample)
-        else: # if not, then just 0 tensor
-            ic_rgb = torch.zeros((self.num_images, 3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+            else: # if not, then just send the 0 tensor
+                ic_rgb.append(torch.zeros((3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32))
+        return ic_rgb, ic_paths
 
-        arcface_embeddings = []
-        if self.arcface_embeddings_dir is not None:
-            if ic_mask is not None: # if using InfU + IC-light
-                for i, (is_infu, cam) in enumerate(zip(ic_mask, camera_order)):
-                    try:
-                        if is_infu: # not implemented yet
-                            arcface_embedding = self._read_arcface_embeddings("infu", subject_id, cam, f"{timestep}_img.png")
-                        elif self.ref_mask[i]:
-                            arcface_embedding = self._read_arcface_embeddings("mvhn", subject_id, cam, f"{timestep}_img.jpg")
-                        else:
-                            arcface_embedding = self._read_arcface_embeddings("iclight", subject_id, cam, f"{timestep}_img.png")
-                    except KeyError:
-                        arcface_embedding = None
-                    except Exception as e:
-                        print(f"Error reading arcface embedding: {e}")
-                        arcface_embedding = None
-                    arcface_embeddings.append(arcface_embedding)
-            else: # if only using IC-light or no ic
-                for is_ref, cam in zip(self.ref_mask, camera_order):
-                    # For reference frames, use GT embedding
-                    # For target frames, also use GT for training
-                    try:
-                        if is_ref:
-                            arcface_embedding = self._read_arcface_embeddings("mvhn", subject_id, cam, f"{timestep}_img.jpg")
-                        else:
-                            arcface_embedding = self._read_arcface_embeddings("iclight", subject_id, cam, f"{timestep}_img.png")
-                    except KeyError:
-                        arcface_embedding = None
-                    arcface_embeddings.append(arcface_embedding)
-            
-            # Convert to tensor [T, 512]
-            # Handle None values by replacing with zeros
-            arcface_embeddings = [
-                torch.tensor(emb) if emb is not None else torch.zeros(512)
-                for emb in arcface_embeddings
-            ]
-            arcface_embeddings = torch.stack(arcface_embeddings)
-            arcface_embeddings[~input_frames_mask] *= 0
-            # don't use arcface embedding for target frames
-        # NOTE: it's possible that we can just average all of these out
-        # to get the average face embedding (which proves to be effective in the InstantID paper)
-
-        # get sapiens conditionings; NOTE: these are of original image size (need to crop later)
-        sapiens_conditionings = {}
-        if self.use_sapiens_conditioning is not None:
-            for cond in self.use_sapiens_conditioning:
-                sapiens_conditionings[cond] = []
-                for i, camera in enumerate(camera_order):
-                    is_ref = self.ref_mask[i]
-                    is_iclight = ic_mask[i].item() if ic_mask is not None else False # True = ICLight, False = InfU
-                        
-                    try: 
-                        cond_tensor = None
-                        if is_ref:
-                            # The reference frame always uses MVHN ground truth
-                            cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="mvhn")
-                        elif ic_mask is not None: 
-                            # We are in 'use_inconsistent=True' mode
-                            if is_iclight:
-                                # This is an IC-Light frame. Load ICLight sapiens data.
-                                cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="iclight")
-                            else:
-                                # This is an InfU frame. Load InfU sapiens data.
-                                cond_tensor = self._sapiens_get(cond, subject_id, camera, f"{infu_random_indices[i]:06d}", dataset_type="infu")
-                        elif input_frames_mask[i] and not is_ref:
-                            # This handles non-reference input frames when use_inconsistent=False
-                            # All "clean" data comes from MVHN
-                            cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="mvhn")
-                        cond_tensor = torch.nan_to_num(cond_tensor, nan=0) # masks have 'nan' as background values
-                    except Exception as e:
-                        pass
-                    if cond_tensor is None:
-                        if cond == "depth":
-                            cond_tensor = torch.zeros((1, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
-                        elif cond == "seg_masks":
-                            # expand later using one_hot_encode_segmentation
-                            cond_tensor = torch.zeros((1, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
-                        elif cond == "latents":
-                            cond_tensor = torch.zeros((4, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
-                    else:
-                        cond_tensor = cond_tensor.unsqueeze(0)
-                    sapiens_conditionings[cond].append(cond_tensor)
-        else: # no sapiens conditioning
-            pass
-            
-        camera_mask = torch.ones(self.num_images, dtype=torch.bool)
-
-        def get_c2w(cam):
-            tf_matrix = create_transform_matrix(
-                np.array(extrinsics[cam]['rotation']),
-                np.array(extrinsics[cam]['translation']) * camera_scale,
-                homogeneous=True
-            )
-
-            return np.linalg.inv(tf_matrix) # w2c -> c2w
-
-        # Read extrinsics (w2c -> c2w)
-        all_c2ws = np.array([
-            get_c2w(cam) for cam in frames_info.keys() # these keys are SORTED
-        ])
-
-        all_c2ws = torch.from_numpy(all_c2ws).float() # (total_cameras=48, 4, 4)
-        c2ws = all_c2ws[images_permutation]    # choose previously sampled ones only (NOTE: order is unknown right now, need to edit!)
-        center_cameras(all_c2ws, c2ws)  # mean center
-        scale_cameras(c2ws)
-
+    def _crop_and_transform_frames_and_intrinsics(
+        self, frames_info, frames, ic_rgb, subject_id, cam_order, intrinsics, ref_mask, sapiens_conditionings):
+        """
+        Crop and transform frames while updating intrinsics as needed.
+        Args:
+            frames: list of frames
+            ic_rgb: list of inconsistent frames
+            cam_order: list of camera order
+        """
         # create intrinsics tensor, update intrinsics
         if self.random_crop or self.maximal_crop:
-            annots_jsons = [frames_info[cam]["annots"] for cam in camera_order]
+            annots_jsons = [frames_info[cam]["annots"] for cam in cam_order]
             crop_params = []
             face_bboxes_adjusted = []
             for annots_json in annots_jsons:
@@ -849,7 +797,7 @@ class MVHumanNetDataset(Dataset):
             #             cond_tensor = torch.nn.functional.interpolate(cond_tensor.unsqueeze(0), size=(self.target_shape[0], self.target_shape[1]), mode='bilinear', align_corners=False).squeeze(0)
 
             # face bboxes can be found
-            annots_jsons = [frames_info[cam]["annots"] for cam in camera_order]
+            annots_jsons = [frames_info[cam]["annots"] for cam in cam_order]
             face_bboxes_adjusted = []
             for annots_json in annots_jsons:
                 face_bbox = annots_json['bbox_face'][:4] # this is from facebbox dir
@@ -922,30 +870,193 @@ class MVHumanNetDataset(Dataset):
                             cond_tensor = one_hot_encode_segmentation(cond_tensor, 28)
             sapiens_conditionings = {cond: torch.stack(cond_tensor, dim=0) for cond, cond_tensor in sapiens_conditionings.items()}
 
-        # load latents if we provided a path
-        if self.latents_dir is not None and os.path.exists(os.path.join(self.latents_dir, subject_id, f"{subject_id}.npz")) and not self.maximal_crop:
-            npz_file = os.path.join(self.latents_dir, subject_id, f"{subject_id}.npz")
-            # npz_data = np.load(npz_file) # this is already for the current subject
-            with np.load(npz_file) as npz_data:
-                latent_tensors = [npz_data[f"{sample_cam}.{timestep}"] for sample_cam in camera_order]
-                clean_latents = torch.stack([torch.from_numpy(latent_tensor) for latent_tensor in latent_tensors]) # (B, 4, 72, 72)
-        else: # encode frames on the fly (DO NOT DO THIS IN DATASET)
-            clean_latents = 0  # just use 'frames' (already pre-masked and cropped) in SevaWrapper
-            # clean_latents = torch.zeros((self.num_images, 4, self.target_shape[0], self.target_shape[1]))
+        return frames, ic_rgb, Ks, sapiens_conditionings, face_bboxes_adjusted
 
-        w2cs = torch.linalg.inv(c2ws)
-        pluckers = get_plucker_coordinates(
-            extrinsics_src=w2cs[input_frames_indices[0]],
+    def _get_arcface_embeddings(self, subject_id, timestep, cam_order, input_target_mask, ref_mask, ic_masks):
+        arcface_embeddings = []
+        if self.arcface_embeddings_dir is not None:
+            for is_ref, is_iclight, is_infu, cam in zip(ref_mask, ic_masks['iclight'], ic_masks['infu'], cam_order):   
+                try:
+                    if is_ref: # not implemented yet
+                        arcface_embedding = self._read_arcface_embeddings("mvhn", subject_id, cam, f"{timestep}_img.jpg")
+                    elif is_infu:
+                        arcface_embedding = self._read_arcface_embeddings("infu", subject_id, cam, f"{timestep}_img.png")
+                    elif is_iclight: # is iclight
+                        arcface_embedding = self._read_arcface_embeddings("iclight", subject_id, cam, f"{timestep}_img.png")
+                    else:
+                        arcface_embedding = None
+                except KeyError:
+                    arcface_embedding = None
+                except Exception as e:
+                    print(f"Error reading arcface embedding: {e}")
+                    arcface_embedding = None
+                arcface_embeddings.append(arcface_embedding)
+            
+            # Convert to tensor [T, 512]
+            # Handle None values by replacing with zeros
+            arcface_embeddings = [
+                torch.tensor(emb) if emb is not None else torch.zeros(512, dtype=torch.float32)
+                for emb in arcface_embeddings
+            ]
+            arcface_embeddings = torch.stack(arcface_embeddings)
+            arcface_embeddings[~input_target_mask] *= 0
+            # don't use arcface embedding for target frames
+            # NOTE: it's possible that we can just average all of these out
+            # to get the average face embedding (which proves to be effective in the InstantID paper)
+        else: # zero tensor
+            arcface_embeddings = torch.zeros((self.num_images, 512), dtype=torch.float32)
+        
+        return arcface_embeddings
+
+    def _get_sapiens_conditionings(self, subject_id, timestep, cam_order, ic_paths, input_target_mask, ref_mask, ic_masks):
+        """
+        Get sapiens conditionings.
+        Args:
+            subject_id: subject ID
+            timestep: timestep
+            cam_order: list of camera order
+        """
+         # get sapiens conditionings; NOTE: these are of original image size (need to crop later)
+        sapiens_conditionings = {}
+        if self.use_sapiens_conditioning is not None:
+            for cond in self.use_sapiens_conditioning:
+                sapiens_conditionings[cond] = []
+                for is_ref, is_iclight, is_infu, camera, ic_path in zip(ref_mask, ic_masks['iclight'], ic_masks['infu'], cam_order, ic_paths):
+                    try: 
+                        cond_tensor = None
+                        if is_ref:
+                            # The reference frame always uses MVHN ground truth
+                            cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="mvhn")
+                        elif is_iclight: 
+                            cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="iclight")
+                        else: # infu
+                            cond_tensor = self._sapiens_get(cond, subject_id, camera, f"{os.path.basename(ic_path).split('_')[0]}", dataset_type="infu")
+
+                        cond_tensor = torch.nan_to_num(cond_tensor, nan=0) # masks have 'nan' as background values
+                    except Exception as e:
+                        pass
+                    if cond_tensor is None:
+                        if cond == "depth":
+                            cond_tensor = torch.zeros((1, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+                        elif cond == "seg_masks":
+                            # expand later using one_hot_encode_segmentation (in crop_and_transform_frames_and_intrinsics)
+                            # refactor and decouple later 
+                            cond_tensor = torch.zeros((1, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+                        elif cond == "latents":
+                            cond_tensor = torch.zeros((4, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+                    else:
+                        cond_tensor = cond_tensor.unsqueeze(0)
+                    sapiens_conditionings[cond].append(cond_tensor)
+        return sapiens_conditionings
+
+
+    def __len__(self):
+        return len(self.scenes)
+    
+    def __getitem__(self, idx):
+        """
+        Collect multi-views + conditioning data for a scene at a fixed timestep,
+        preprocess for training loop.
+        """
+        scene = self.scenes[idx] # get scene content info
+        subject_id = scene['subject_id'] # ex. 100001
+        timestep = scene['timestep'] # ex. 0005
+        frames_info = dict(sorted(scene['frames_info'].items())) # camera dict data (annots)
+        subject_path = os.path.join(self.root_dir, subject_id)
+
+        # get camera parameters
+        extrinsics = self.cam_params[subject_id]['extrinsics']
+        intrinsics = np.array(self.cam_params[subject_id]['intrinsics'])
+        camera_scale = self.cam_params[subject_id]['camera_scale'] 
+
+        if self.pre_scale_intrinsics != 1:
+            # update intrinsics (required for MVHumanNet; default 0.5x prescaling)
+            intrinsics = update_intrinsics_resize(intrinsics, scale=self.pre_scale_intrinsics)
+
+        # Sample multi-view frame + subject mask indices (as string paths)
+        img_paths, img_mask_paths, cam_order, sample_permutation = self._sample_multiview_image_paths(frames_info)
+        
+        # generate masks for input/target frames split, reference frame, and IC/InfU frames
+        input_target_mask, ref_mask, ic_masks = self._sample_all_masks()
+        iclight_mask = ic_masks["iclight"]
+        infu_mask = ic_masks["infu"]
+
+        # load raw GT frames from MVHN
+        frames = self._load_raw_frames(img_paths, img_mask_paths)
+
+        # loads inconsistent frames from IC-light and InfU synthetic data
+        ic_rgb, ic_paths = self._load_inconsistent_frames(
+            img_paths, img_mask_paths, cam_order,
+            subject_id, timestep, ref_mask, ic_masks
+        )
+
+        # arcface conditionings
+        arcface_embeddings = self._get_arcface_embeddings(
+            subject_id, timestep, cam_order, input_target_mask, ref_mask, ic_masks
+        )
+
+        # sapiens conditionings
+        sapiens_conditionings = self._get_sapiens_conditionings(
+            subject_id, timestep, cam_order, ic_paths, input_target_mask, ref_mask, ic_masks
+        )
+
+        # transform GT and inconsistent frames + intrinsics to desired shape
+        frames, ic_rgb, Ks, sapiens_conditionings, face_bboxes_adjusted = self._crop_and_transform_frames_and_intrinsics(
+            frames_info, frames, ic_rgb,
+            subject_id, cam_order, intrinsics,
+            ref_mask, sapiens_conditionings
+        )
+
+        # this will always be constant 1-tensor (according to pretrained model authors)
+        camera_mask = torch.ones(self.num_images, dtype=torch.bool)
+
+        def get_c2w(cam):
+            tf_matrix = create_transform_matrix(
+                np.array(extrinsics[cam]['rotation']),
+                np.array(extrinsics[cam]['translation']) * camera_scale,
+                homogeneous=True
+            )
+
+            return np.linalg.inv(tf_matrix) # w2c -> c2w
+
+        # Read extrinsics (w2c -> c2w) to fit SEVA camera convention
+        all_c2ws = np.array([
+            get_c2w(cam) for cam in frames_info.keys() # these keys are SORTED
+        ])
+
+        all_c2ws = torch.from_numpy(all_c2ws).float() # (total_cameras=48, 4, 4)
+        c2ws = all_c2ws[sample_permutation] # extrinsics for sampled cameras
+        center_cameras(all_c2ws, c2ws) # mean center
+        scale_cameras(c2ws)
+
+        # plucker coordinates for all cameras
+        w2cs = torch.linalg.inv(c2ws) # c2w -> w2c
+        # Find the first input frame (first True in input_target_mask) to use as source camera
+        # argmax returns the first True index, or 0 if all False
+        src_camera_idx = input_target_mask.to(torch.int).argmax().item()
+        pluckers = get_plucker_coordinates( # relative to the first camera in the sample
+            extrinsics_src=w2cs[src_camera_idx],
             extrinsics=w2cs,
             intrinsics=Ks.clone(),
             target_size=(self.target_shape[0] // self.downsample_factor, 
                          self.target_shape[1] // self.downsample_factor),
         )
 
+        # load preloaded latents if provided (mostly deprecated)
+        if self.latents_dir is not None and os.path.exists(os.path.join(self.latents_dir, subject_id, f"{subject_id}.npz")) and not self.maximal_crop:
+            npz_file = os.path.join(self.latents_dir, subject_id, f"{subject_id}.npz")
+            # npz_data = np.load(npz_file) # this is already for the current subject
+            with np.load(npz_file) as npz_data:
+                latent_tensors = [npz_data[f"{sample_cam}.{timestep}"] for sample_cam in cam_order]
+                clean_latents = torch.stack([torch.from_numpy(latent_tensor) for latent_tensor in latent_tensors]) # (B, 4, 72, 72)
+        else: # else encode frames on the fly (loaded in diffusion.py)
+            clean_latents = 0 # indicates to diffusion.py to encode on the fly
+
+
         concat = torch.cat( # binary masks (inp/tgt + ref) and pluckers
             [
                 repeat(
-                    input_frames_mask,
+                    input_target_mask,
                     "n -> n 1 h w",
                     h=pluckers.shape[2],
                     w=pluckers.shape[3],
@@ -993,7 +1104,7 @@ class MVHumanNetDataset(Dataset):
             # - replace gets updated
             output_dict = {
                 "clean_latent": clean_latents, # unscaled clean latents
-                "mask": input_frames_mask,
+                "mask": input_target_mask,
                 "ref_mask": ref_mask, # "one hot" mask for reference images 
                 # "ic_paths": ic_paths, # synthetic data paths
                 "ic_rgb": ic_rgb, # ! NOTE: normalized!
