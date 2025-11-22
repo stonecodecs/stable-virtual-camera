@@ -245,6 +245,7 @@ class MultiviewTransformer(nn.Module):
         dropout: float = 0.0,
         use_ip_adapter: bool = False,
         face_context_dim: int | None = None,
+        ip_lambda_weight: float = 1.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -260,6 +261,7 @@ class MultiviewTransformer(nn.Module):
         if use_ip_adapter:
             assert face_context_dim is not None
             block_kwargs["face_context_dim"] = face_context_dim
+            block_kwargs["lambda_weight"] = ip_lambda_weight
 
         self.transformer_blocks = nn.ModuleList(
             [
