@@ -238,6 +238,7 @@ class RandomBBoxCropper(object):
 
         # get new crop coordinates
         x1, y1, x2, y2 = bbox.T
+        prev_pad_bbox = bbox.clone()
         # if negative coordinates, need to pad the image (K already previously updated)
         images, bbox = self._possibly_pad_img(images, x1, y1, x2, y2)
         x1, y1, x2, y2 = bbox.T
@@ -261,7 +262,7 @@ class RandomBBoxCropper(object):
 
         # perform the actual crop
         cropped_images = self.crop_images(images, x1, y1, x2, y2)
-        return cropped_images, K_new, rel_bbox, face_bboxes_new if face_bboxes is not None else None, bbox.int()
+        return cropped_images, K_new, rel_bbox, face_bboxes_new if face_bboxes is not None else None, bbox.int(), prev_pad_bbox.int()
 
 
 def percent_to_absolute(arr, abs_arr):

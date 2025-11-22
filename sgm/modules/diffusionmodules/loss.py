@@ -154,6 +154,7 @@ class StandardDiffusionLoss(nn.Module):
             face_bbox=batch.get("face_bbox"),
             ref_mask=batch.get("ref_mask"),
             enable_face_weighting=self.face_weighting > 0.0,
+            loss_mask=batch.get("frames_masks", None),
         )
 
         # Add auxiliary ArcFace identity loss if enabled
@@ -277,12 +278,20 @@ class StandardDiffusionLoss(nn.Module):
         return face_loss
 
 
-    def get_loss(self, model_output, target, w, face_bbox=None, ref_mask=None, enable_face_weighting=False):
+    def get_loss(self, model_output, target, w, face_bbox=None, ref_mask=None, enable_face_weighting=False, loss_mask=None):
         # add face weighting if face_weighting > 0.0
         additional_loss = torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
+        if loss_mask is not None:
+            assert loss_mask.shape[0] == model_output.shape[0], f"Loss mask batch size mismatch. Got {loss_mask.shape[0]} but expected {model_output.shape[0]}."
+            # use F.interpolate to resize the loss mask to the latent spatial dimensions
+            # HACK: hardcoded 8x downsampling
+            loss_mask = F.interpolate(
+                loss_mask.flatten(start_dim=0, end_dim=1), size=model_output.shape[-2:], mode='bilinear'
+            ).unflatten(dim=0, sizes=model_output.shape[:2])
+            loss_mask = torch.clamp(loss_mask, min=0.01, max=1.0).float() # downweight background by 100x (but not zero!)
  
         if self.loss_type == "l2":
-            spatial_loss = w * (model_output - target) ** 2 # [B, T, C, H, W]
+            spatial_loss = w * (model_output - target) ** 2 * loss_mask# [B, T, C, H, W]
             loss = torch.mean(
                 spatial_loss.reshape(target.shape[0], -1), 1
             )
@@ -291,7 +300,7 @@ class StandardDiffusionLoss(nn.Module):
                 loss = loss + additional_loss
             return loss
         elif self.loss_type == "l1":
-            spatial_loss = w * (model_output - target).abs()
+            spatial_loss = w * (model_output - target).abs() * loss_mask
             loss = torch.mean(
                 spatial_loss.reshape(target.shape[0], -1), 1
             )
@@ -299,7 +308,7 @@ class StandardDiffusionLoss(nn.Module):
                 additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss, ref_mask)
                 loss = loss + additional_loss
             return loss
-        elif self.loss_type == "lpips":
+        elif self.loss_type == "lpips": # only really usable in RGB space
             loss = self.lpips(model_output, target).reshape(-1)
             if enable_face_weighting and face_bbox is not None and ref_mask is not None:
                 additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, loss, ref_mask)

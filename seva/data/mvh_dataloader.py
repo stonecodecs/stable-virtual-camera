@@ -784,8 +784,9 @@ class MVHumanNetDataset(Dataset):
             bbox_params = torch.stack([torch.tensor(bbox) * bbox_annot_scale for bbox in crop_params])
 
             face_params = torch.stack([torch.tensor(face_bbox) for face_bbox in face_bboxes_adjusted]) if self.face_bboxes is not None else torch.stack([torch.tensor([-1, -1, -1, -1]) for _ in range(self.num_images)])
-            frames, Ks, rel_bbox, face_bboxes_result, new_bbox = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=face_params)
-            image_masks, _ = self.cropper._possibly_pad_img(image_masks.unsqueeze(1), new_bbox[:,0], new_bbox[:,1], new_bbox[:,2], new_bbox[:,3])
+            frames, Ks, rel_bbox, face_bboxes_result, new_bbox, bbox_before_pad = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=face_params)
+            # ! this is bugged; ensure that padding is correctly done 
+            image_masks, _ = self.cropper._possibly_pad_img(image_masks.unsqueeze(1), bbox_before_pad[:,0], bbox_before_pad[:,1], bbox_before_pad[:,2], bbox_before_pad[:,3])
             image_masks = self.cropper.crop_images(image_masks, new_bbox[:,0], new_bbox[:,1], new_bbox[:,2], new_bbox[:,3])
             if face_bboxes_result is not None:
                 face_bboxes_adjusted = face_bboxes_result
@@ -1040,6 +1041,7 @@ class MVHumanNetDataset(Dataset):
             subject_id, cam_order, intrinsics,
             ref_mask, ic_masks, sapiens_conditionings
         )
+        img_masks = img_masks / 255.0 # convert to [0, 1]
 
         # this will always be constant 1-tensor (according to pretrained model authors)
         camera_mask = torch.ones(self.num_images, dtype=torch.bool)
