@@ -264,7 +264,7 @@ class VanillaCFG(object):
         c_out = dict()
 
         for k in c:
-            if k in ["vector", "crossattn", "concat", "mask", "plucker", "replace", "dense_vector"]:
+            if k in ["vector", "crossattn", "concat", "mask", "plucker", "replace", "dense_vector", "face_cond"]:
                 c_out[k] = torch.cat((uc[k], c[k]), 0)
             else:
                 print("k:", k)

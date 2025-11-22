@@ -4,6 +4,7 @@ from einops import rearrange, repeat
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
+from typing import cast
 
 
 class GEGLU(nn.Module):
@@ -69,10 +70,9 @@ class Attention(nn.Module):
             lambda t: rearrange(t, "b l (h d) -> b h l d", h=self.heads).contiguous(),
             (q, k, v),
         )
+
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             out = F.scaled_dot_product_attention(q, k, v).contiguous()
-        
-        # Convert back to original dtype
         out = rearrange(out, "b h l d -> b l (h d)").contiguous()
         out = self.to_out(out)
         return out
@@ -110,6 +110,69 @@ class TransformerBlock(nn.Module):
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         x = self.attn1(self.norm1(x)) + x
         x = self.attn2(self.norm2(x), context=context) + x
+        x = self.ff(self.norm3(x)) + x
+        return x
+
+
+class IPAdapterTransformerBlock(nn.Module):
+    # IPAdapter/InstantID cross attention block
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        d_head: int,
+        context_dim: int,
+        face_context_dim: int,
+        dropout: float = 0.0,
+        lambda_weight: float = 1.0 # weight for face attention
+    ):
+        super().__init__()
+        # To load pretrained weights
+        self.attn1 = Attention(
+            query_dim=dim,
+            heads=n_heads,
+            dim_head=d_head,
+            dropout=dropout,
+        )
+        self.ff = FeedForward(dim, dropout=dropout)
+        self.attn2 = Attention(
+            query_dim=dim,
+            context_dim=context_dim,
+            heads=n_heads,
+            dim_head=d_head,
+            dropout=dropout,
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
+
+        # New IP-Adapter layers
+        self.attn_face = Attention(
+            query_dim=dim,
+            context_dim=context_dim, # Project to the same dim as text context
+            heads=n_heads,
+            dim_head=d_head,
+            dropout=dropout,
+        )
+        nn.init.zeros_(self.attn_face.to_out[0].weight)
+        nn.init.zeros_(self.attn_face.to_out[0].bias)
+        self.lambda_weight = lambda_weight
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor, face_context: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.attn1(self.norm1(x)) + x
+        x_norm = self.norm2(x)
+        clip_attn_output = self.attn2(x_norm, context=context)
+        
+        if face_context is not None:
+            # The attention layer expects a 3D tensor: [batch, seq_len, features]
+            # Reshape context to combine frames and tokens for the attention mechanism
+            if face_context.ndim == 4:
+                face_context = rearrange(face_context, "b f n d -> b (f n) d")
+            face_attn_output = self.attn_face(x_norm, context=face_context) * self.lambda_weight
+            x = clip_attn_output + face_attn_output + x
+        else:
+            x = clip_attn_output + x
+
         x = self.ff(self.norm3(x)) + x
         return x
 
@@ -180,22 +243,35 @@ class MultiviewTransformer(nn.Module):
         depth: int = 1,
         context_dim: int = 1024,
         dropout: float = 0.0,
+        use_ip_adapter: bool = False,
+        face_context_dim: int | None = None,
+        ip_lambda_weight: float = 1.0,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.name = name
         self.unflatten_names = unflatten_names
+        self.use_ip_adapter = use_ip_adapter
         inner_dim = n_heads * d_head
         self.norm = nn.GroupNorm(32, in_channels, eps=1e-6)
         self.proj_in = nn.Linear(in_channels, inner_dim)
+
+        block_class = IPAdapterTransformerBlock if use_ip_adapter else TransformerBlock
+        block_kwargs = {}
+        if use_ip_adapter:
+            assert face_context_dim is not None
+            block_kwargs["face_context_dim"] = face_context_dim
+            block_kwargs["lambda_weight"] = ip_lambda_weight
+
         self.transformer_blocks = nn.ModuleList(
             [
-                TransformerBlock(
+                block_class(
                     inner_dim,
                     n_heads,
                     d_head,
                     context_dim=context_dim,
                     dropout=dropout,
+                    **block_kwargs,
                 )
                 for _ in range(depth)
             ]
@@ -216,7 +292,7 @@ class MultiviewTransformer(nn.Module):
         )
 
     def _forward(
-        self, x: torch.Tensor, context: torch.Tensor, num_frames: int
+        self, x: torch.Tensor, context: torch.Tensor, num_frames: int, face_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert context.ndim == 3
         _, _, h, w = x.shape
@@ -230,6 +306,8 @@ class MultiviewTransformer(nn.Module):
 
         if self.name in self.unflatten_names:
             context = context[::num_frames]
+            if face_context is not None:
+                face_context = rearrange(face_context, "(b t) ... -> b t ...", t=num_frames)
 
         x = self.norm(x)
         x = rearrange(x, "b c h w -> b (h w) c").contiguous()
@@ -238,7 +316,12 @@ class MultiviewTransformer(nn.Module):
         for block, mix_block in zip(self.transformer_blocks, self.time_mix_blocks):
             if self.name in self.unflatten_names:
                 x = rearrange(x, "(b t) (h w) c -> b (t h w) c", t=num_frames, h=h, w=w).contiguous()
-            x = block(x, context=context)
+            
+            if self.use_ip_adapter:
+                x = block(x, context=context, face_context=face_context)
+            else:
+                x = block(x, context=context)
+
             if self.name in self.unflatten_names:
                 x = rearrange(x, "b (t h w) c -> (b t) (h w) c", t=num_frames, h=h, w=w).contiguous()
             x_mix = mix_block(x, context=time_context, num_frames=num_frames)
@@ -249,15 +332,16 @@ class MultiviewTransformer(nn.Module):
         out = x + x_in
         return out
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor, num_frames: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, context: torch.Tensor, num_frames: int, face_context: torch.Tensor | None = None) -> torch.Tensor:
         if self.training:
-            return checkpoint(
+            return cast(torch.Tensor, checkpoint(
                 self._forward,
                 x,
                 context,
                 num_frames,
+                face_context,
                 preserve_rng_state=False,
                 use_reentrant=False,
-            )
+            ))
         else:
-            return self._forward(x, context, num_frames)
+            return self._forward(x, context, num_frames, face_context=face_context)

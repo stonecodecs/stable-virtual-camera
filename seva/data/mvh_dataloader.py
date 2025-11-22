@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import multivariate_normal
 from PIL import Image
 import torchvision.transforms.v2 as T
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from seva.data.preprocessing import (
     update_intrinsics,
@@ -42,6 +43,7 @@ import time
 from seva.data.cropper import RandomBBoxCropper
 from seva.modules.autoencoder import AutoEncoder
 import torchvision
+import h5py
 
 # NOTE: hardcoded camera order for each camera elevation (counter clockwise)
 # use for trajectory NVS training!
@@ -99,6 +101,58 @@ def scale_cameras(c2ws, camera_scale=2.0):
     )
     c2ws[:, :3, 3] *= translation_scaling_factor
 
+
+def read_from_hdf5(hdf5_file, *args):
+    # each arg will be nested keys
+    try:
+        with h5py.File(hdf5_file, 'r') as f:
+            # Navigate through nested keys
+            current = f
+            for arg in args:
+                current = current[arg]
+            
+            # Read the data into memory before closing the file
+            if isinstance(current, h5py.Dataset):
+                # For datasets, read the actual data
+                return np.array(current)
+            elif isinstance(current, h5py.Group):
+                # For groups, return a dict of the group structure
+                return {key: current[key] for key in current.keys()}
+            else:
+                return current
+    except KeyError:
+        return None
+    except Exception as e:
+        print(f"Error reading HDF5 file: {e}")
+        return None
+
+
+def one_hot_encode_segmentation(seg_map: torch.Tensor, num_classes: int, classes_to_use: list = []) -> torch.Tensor:
+    """
+    Converts a segmentation label map to a one-hot encoded tensor.
+
+    Args:
+        seg_map (torch.Tensor): The segmentation map. 
+                                Expected shape (1, H, W) or (H, W).
+                                Must contain class indices (e.g., 0, 1, ... N-1).
+        num_classes (int): The total number of classes.
+
+    Returns:
+        torch.Tensor: The one-hot encoded tensor of shape (num_classes, H, W).
+    """
+    if len(classes_to_use) > 0:
+        seg_map_ = seg_map[classes_to_use]
+    else: # otherwise, use all classes if empty
+        seg_map_ = seg_map
+    # Squeeze out the channel dim if it exists, (1, H, W) -> (H, W)
+    if seg_map_.dim() == 3 and seg_map_.shape[0] == 1:
+        seg_map_ = seg_map_.squeeze(0)
+    
+    seg_map_long_ = seg_map_.long()
+    one_hot = F.one_hot(seg_map_long_, num_classes=num_classes)
+    one_hot_ = one_hot.permute(2, 0, 1)
+    return one_hot_.float()
+
 class MVHumanNetDataset(Dataset):
     def __init__(
         self,
@@ -106,7 +160,7 @@ class MVHumanNetDataset(Dataset):
         num_images,
         latents_dir=None,
         transforms=None,
-        pre_scale=0.5,
+        pre_scale_intrinsics=0.5,
         data_limit=None,
         only_include=None,
         exclude=None,
@@ -115,17 +169,23 @@ class MVHumanNetDataset(Dataset):
         white_background=False,
         step_size=60,
         preload_path=None,
-        synthetic_dataset_path=None,
+        iclight_dataset_path=None,
+        infu_dataset_path=None,
+        face_bbox_dir=None,
+        arcface_embeddings_dir=None,
         crop_padding=60, # used to prevent clipping of the humans
         use_inconsistent=False,
         random_crop_prob=0.3, # probability of using random crop over maximal
+        ic_sampling_prob=0.7, # probability of randomly sampling from InfU over IC light
         fixed_sampling_ids=None,
+        use_sapiens_conditioning=None, # list of "depth, seg, latents" later
+        sapiens_segmentation_channels_to_use=[], # face
     ):
         self.root_dir = root_dir             # directory of all subject directories
         self.latents_dir = latents_dir       # directory of all latents
         self.num_images = num_images         # context window T
         self.transforms = transforms         # transforms for the random crop
-        self.pre_scale = pre_scale           # since MVHumanNet is downsampled, update intrinsics
+        self.pre_scale_intrinsics = pre_scale_intrinsics           # since MVHumanNet is downsampled, update intrinsics
         self.only_include = set(only_include) if only_include is not None else None     # TEMP -- include only these subjects (as List of strings)
         self.exclude = set(exclude) if exclude is not None else None               # TEMP -- exclude these subjects (as List of strings)
         self.data_limit = data_limit         # TEMP -- only get the first 'data_limit' (int) subjects
@@ -133,42 +193,49 @@ class MVHumanNetDataset(Dataset):
         self.random_crop = random_crop       # NOTE: this is the toggle for probabilistic cropping 
                                              # ! unrelated to initial crop from crop_params.json
                                              # ! (human-centered 576x576 image crop) 
+
         self.random_crop_prob = random_crop_prob
         self.maximal_crop = maximal_crop     # initial crops to the human based on annots
         # NOTE: if the above is set to True, then latents_dir will be ignored
         # and latents will be computed on the fly!
         self.use_inconsistent = use_inconsistent
+        self.ic_sampling_prob = ic_sampling_prob
         # if True, then will concatenate all clean latents with these ic latents
         # if False, then will leave conditioning "black" for target images
         # and will repeat the clean latent for the input images
-
-        # TODO - CURRENT PLAN:
-        # a note on ref_mask and how it will be used:
-        # * not using IC (phase 1): very akin to normal SEVA
-        # - input_mask will determine input & output latents
-        # - targets will have no conditioning
-        # - all input images will have duplicated latent images
-        # - ref_mask will simply be input_mask
-
-        # * using IC (phase 2): incorporate IC latents
-        # - input_mask will be the same (inputs + outputs) but heavily skew
-        #   towards full 8 (num_images) input images
-        # - however, ref_mask will only be a one-hot vector in this case
-        # - all inputs get conditioning, targets continue to get the zero tensor
+        self.use_sapiens_conditioning = use_sapiens_conditioning
+        assert self.use_sapiens_conditioning is None or all(cond in ["depth", "seg_masks", "latents"] for cond in self.use_sapiens_conditioning), "Invalid sapiens conditioning!"
+        self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
         self.fixed_sampling_ids = fixed_sampling_ids
         self.adjacent_frame_sampling_prob = 0.2 # Trajectory NVS acceptance rate
-        self.all_inputs_prob = 0.8
+        self.all_inputs_prob = 0.85
         self.white_background = white_background
         self.preload_path = preload_path
-        self.synthetic_dataset_path = synthetic_dataset_path # IC-light/InfU output directory
+        self.iclight_dataset_path = iclight_dataset_path # IC-light output directory
+        self.infu_dataset_path = infu_dataset_path # InfU output directory
+        self.face_bbox_dir = face_bbox_dir # Face bounding box directory
+        self.arcface_embeddings_dir = arcface_embeddings_dir # ArcFace embeddings directory
+        # NOTE: currently we only have arcface_embeddings for MVHN gt dataset
+    
         # if not None, will use the "phase 2" expected training process
+        self.infu_num_images = {} # Dict[subject_id: int] number of images in infu directory
+        if self.infu_dataset_path is not None:
+            subjects_to_parse = os.listdir(self.infu_dataset_path)
+            for subject_id in subjects_to_parse:
+                if self.exclude is not None and subject_id in self.exclude:
+                    continue
+                if self.only_include is not None and subject_id not in self.only_include:
+                    continue
+                self.infu_num_images[subject_id] = len(os.listdir(os.path.join(self.infu_dataset_path, subject_id))) - 2
+                # -2 is a HACK to avoid I/O checking; this accounts for the npz masks
 
         if self.num_images > 16: # if more than 16, disable trajectory NVS batching
             self.adjacent_frame_sampling_prob = 0.0
         self.crop_padding = crop_padding
         # actual data
         self.cam_params = {} # Dict[subject: (extrinsics, intrinsics, camera_scale)]
-        self.scenes = self._load_scenes() if preload_path is None else self._load_preloaded_filepaths()
+        self.face_bboxes = self._load_face_bboxes() if face_bbox_dir is not None else None # * needs to be loaded BEFORE scenes
+        self.scenes = self._load_preloaded_filepaths()
         self.image_shape = (1500, 2048) # MVHumanNet images are 2048x1500
 
         # from SD 2.1 VAE
@@ -186,6 +253,11 @@ class MVHumanNetDataset(Dataset):
                 T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)]),                      # Convert to tensor
                 T.Normalize([0.5], [0.5])          # Normalize to [-1, 1]
             ])
+            self.mask_transform = T.Compose([
+                T.CenterCrop(self.image_shape[0]), # Center crop to square
+                T.Resize(self.target_shape),       # Resize to target shape
+                T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)]),  # Convert to tensor, keep in [0, 1]
+            ])
 
         if self.random_crop or self.maximal_crop:
             self.cropper = RandomBBoxCropper(
@@ -198,9 +270,13 @@ class MVHumanNetDataset(Dataset):
                 T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)]),
                 T.Normalize([0.5], [0.5])
             ])
+            self.mask_transform = T.Compose([
+                T.Resize(self.target_shape),       # Resize to target shape
+                T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)]),  # Convert to tensor, keep in [0, 1]
+            ])
 
-        if self.pre_scale != 0.5:
-            print("WARNING: pre_scale is not 0.5, which is expected for MVHumanNet!")
+        if self.pre_scale_intrinsics != 0.5:
+            print("WARNING: pre_scale_intrinsics is not 0.5, which is expected for MVHumanNet!")
         print("MVHN::init done!")
 
 
@@ -213,6 +289,34 @@ class MVHumanNetDataset(Dataset):
             cleaned_data[camera_id] = value
         return cleaned_data
 
+    def _load_face_bboxes(self):
+        """
+        Load face bboxes from a directory of sharded jsons, each structured as:
+        {
+            "<subject_id>": {
+                "<camera_id>": {
+                    "<timestep>": {
+                        "x1, y1, x2, y2, ley_eye, right_eye, left_lip, right_lip" keys
+                        (NOTE: x1, y1, x2, y2 are int, all others are 2-tuples of ints
+                    }...
+                }
+            }
+        }
+        NOTE: assumes that subject keys are all UNIQUE (should be true)
+        """
+        all_face_info = {}
+        for face_json in os.listdir(self.face_bbox_dir):
+            all_face_info.update(load_json(os.path.join(self.face_bbox_dir, face_json)))
+
+        return all_face_info
+
+    def _read_arcface_embeddings(self, *args):
+        """
+        Reads from chosen HDF5 file
+        """
+        # * UPDATE: lazy load from HDF5
+        return read_from_hdf5(os.path.join(self.arcface_embeddings_dir, "arcface_embeddings_merged.hdf5"), *args)
+
     def _load_preloaded_filepaths(self):
         """
         Load preloaded filepaths from a custom json file structured as:
@@ -224,7 +328,7 @@ class MVHumanNetDataset(Dataset):
                 "extrinsics": <dict: camera extrinsics>
                 "intrinsics": <list: camera intrinsics>
                 "camera_scale": <float: camera scale>
-                "annots": {"bbox": <list: bbox coords.>, "bbox_face": <list: face bbox coords.>}
+                "annots": {"bbox": <list: bbox coords.>, "bbox_face": <list: face bbox coords. NOTE: not used since they're unreliable>}
             }
         }
         The above structure gives all that we need to load the filepaths (reducing metadata reads by a lot!)
@@ -286,22 +390,39 @@ class MVHumanNetDataset(Dataset):
             for timestep in iterator:
                 try: # to get all cameras for this timestep (and ENSURE all cameras are present)
                     for camera in cameras:
-                        time_id = timestep if is_list_type else f"{timestep * 5:04d}"
+                        if isinstance(timestep, str) and timestep.endswith("_img.jpg"):
+                            timestep = int(timestep.split("_")[0])
+                        time_id = f"{timestep * 5:04d}"
                         image_path = os.path.join(subject_path, "images_lr", camera, f"{time_id}_img.jpg")
                         mask_path = os.path.join(subject_path, "fmask_lr", camera, f"{time_id}_img_fmask.png")
                         # annots_path = os.path.join(subject_path, "annots", camera, f"{time_id}_img.json")
                         bbox = annots['bbox'][camera][time_id]
-                        face_bbox = annots['bbox_face2d'][camera][time_id]
-                        if (bbox[2] - bbox[0]) == 0 or (bbox[3] - bbox[1]) == 0:
-                            print(f"Skipping subject {subject} camera {camera} timestep {timestep} because bbox is invalid")
-                            continue
+                        # Initialize defaults
+                        face_bbox = [-1, -1, -1, -1]
+                        arcface_embedding = None
+                        
+                        if self.face_bboxes is not None:
+                            # Handle missing face bbox data gracefully
+                            try:
+                                face_bbox_dict = self.face_bboxes[subject][camera][f"{time_id}_img.jpg"]
+                                if face_bbox_dict == {}:
+                                    face_bbox = [-1, -1, -1, -1] # indicates no face detected
+                                else:
+                                    face_bbox = [face_bbox_dict['x1'], face_bbox_dict['y1'], face_bbox_dict['x2'], face_bbox_dict['y2']]
+                            except KeyError:
+                                # Subject/camera/timestep not in face_bboxes - tag as no face
+                                face_bbox = [-1, -1, -1, -1]
+
+                            if face_bbox != [-1, -1, -1, -1] and ((bbox[2] - bbox[0]) == 0 or (bbox[3] - bbox[1]) == 0):
+                                print(f"Skipping subject {subject} camera {camera} timestep {timestep} because bbox is invalid")
+                                continue
 
                         subject_map[time_id][camera] = {
                                     'image_path': image_path,
                                     'mask_path': mask_path,
                                     'annots': {
                                         'bbox': bbox,
-                                        'bbox_face': face_bbox
+                                        'bbox_face': face_bbox if self.face_bboxes is not None else None,
                                     }
                                 }
                 except Exception as e: # NOTE: this is a hack to ignore missing timesteps
@@ -325,7 +446,8 @@ class MVHumanNetDataset(Dataset):
         print("Loading preloaded filepaths completed!")
         return scenes
 
-
+    #! DEPRECATED: online reading of the dataset takes many hours per run just to load!
+    #! therefore, only use preloaded filepaths.
     def _load_scenes(self):
         """
         NEW -- compact loading using priors:
@@ -397,7 +519,7 @@ class MVHumanNetDataset(Dataset):
                             timestep = entry.name.split('_')[0]
                             annots_json = load_json(os.path.join(annots_path, camera, f"{timestep}_img.json"))['annots'][0]
                             bbox = annots_json['bbox']
-                            bbox_face = annots_json['bbox_face2d']
+                            bbox_face = annots_json['bbox_face2d'] # ! not used
                             if bbox[2] - bbox[0] == 0 or bbox[3] - bbox[1] == 0:
                                 print(f"Skipping subject {subject} camera {camera} timestep {timestep} because bbox is invalid")
                                 continue
@@ -428,32 +550,83 @@ class MVHumanNetDataset(Dataset):
                 })
         return scenes
 
-    def __len__(self):
-        return len(self.scenes)
-    
-    def __getitem__(self, idx):
-        scene = self.scenes[idx]
-        subject_id = scene['subject_id'] # ex. 100001
-        timestep = scene['timestep'] # ex. 0005
-        frames_info = dict(sorted(scene['frames_info'].items())) # camera dict
-        subject_path = os.path.join(self.root_dir, subject_id)
+    def _get_infu_path(self, subject_id, timestep):
+        if self.infu_dataset_path is None:
+            return None
+        return self.infu_dataset_path + f"/{subject_id}/{timestep}_{subject_id}_img.png"
 
-        # get camera parameters
-        extrinsics = self.cam_params[subject_id]['extrinsics']
-        intrinsics = np.array(self.cam_params[subject_id]['intrinsics'])
-        camera_scale = self.cam_params[subject_id]['camera_scale'] 
+    def _get_iclight_path(self, subject_id, timestep, camera):
+        if self.iclight_dataset_path is None:
+            return None
+        return self.iclight_dataset_path + f"/{subject_id}/images_lr/{camera}/{timestep}_img.png"
 
-        if self.pre_scale != 1: # update intrinsics (required for MVHumanNet default 0.5x prescaling)
-            intrinsics = update_intrinsics_resize(intrinsics, scale=self.pre_scale)
+    def _sapiens_get(self, cond, subject_id, camera, timestep, dataset_type="mvhn"):
+        try:
+            if dataset_type == "mvhn":
+                npz_path =  os.path.join(self.root_dir, subject_id, f"{subject_id}_{cond}.npz")
+            elif dataset_type == "infu":
+                npz_path = os.path.join(self.infu_dataset_path, subject_id, f"{subject_id}_{cond}.npz")
+            elif dataset_type == "iclight":
+                npz_path = os.path.join(self.iclight_dataset_path, subject_id, f"{subject_id}_{cond}.npz")
+            else:
+                raise ValueError(f"Invalid dataset type: {dataset_type}")
+            data = np.load(npz_path)
+            # if INFU, timestep is the given sample ID instead!
+            query = timestep if dataset_type == "infu" else f"{camera}_{timestep}"
+            return torch.tensor(data[query])
+        except Exception as e:
+            print(f"Error loading sapiens conditioning: {e}")
+            return None
 
-        # Sample frames indices
+    def _load_raw_frames(self, image_paths, mask_paths):
+        """
+        Load multi-view frames from a list of 'image_paths' and their corresponding 'mask_paths'
+        Returns a tensor of shape (num_images, 3, image_shape[0], image_shape[1]).
+
+        Note: these are raw images straight from the dataset.
+        No transform is applied except if needing to resize to expected input shape.
+        """
+        frames = torch.zeros((self.num_images, 3, self.image_shape[0],  self.image_shape[1]))
+        img_masks = torch.zeros((self.num_images, self.image_shape[0], self.image_shape[1]))
+        for i, (img_path, mask_path) in enumerate(zip(image_paths, mask_paths)):
+            image = Image.open(img_path).convert("RGB")
+            img_mask = Image.open(mask_path)
+
+            if img_mask.size != image.size: # ensure matching size! (note: subject 100681 has different sizes!)
+                image = image.resize(img_mask.size, Image.BILINEAR)
+
+            # Create masked image by compositing with black background
+            background = Image.new(
+                'RGB', image.size, (255, 255, 255) if self.white_background else (0, 0, 0)
+            )
+
+            masked_image = Image.composite(image, background, img_mask)
+            frames[i] = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])(masked_image)
+            img_masks[i] = T.Compose([T.ToImage()])(img_mask)
+            del image, img_mask, masked_image # free PIL images
+        return frames, img_masks
+
+    def _sample_multiview_image_paths(self, frames_info: dict, use_iclight: bool = False, use_infu: bool = False) -> Tuple[list[str], list[str], list[str]]:
+        """
+        Sample multi-view frame + subject mask indices (as string paths) from a frames_info dictionary.
+        Returns the sampled images, masks, and camera order.
+        Args:
+            frames_info: dictionary of frames_info for a subject
+            use_iclight: whether to use IC-light
+            use_infu: whether to use InfU
+        Returns:
+            sampled_image_paths: list of sampled image paths
+            sampled_image_mask_paths: list of sampled image mask paths
+            camera_order: list of camera order
+            images_permutation: permutation used to select these subsets
+        """
+        # Sample multi-view frame + subject mask indices (as string paths)
         camera_order = [cam for cam in list(frames_info.keys())] # 48 sorted camera IDs
         sampled_image_paths = [frames_info[cam]['image_path'] for cam in camera_order]
         sampled_image_mask_paths = [frames_info[cam]['mask_path'] for cam in camera_order]
 
         # NOTE: if num_images>16, then trajectory NVS will default to using all in rung
         if np.random.rand() <= self.adjacent_frame_sampling_prob: # for trajectory NVS
-            # print("trajectory NVS")
             # choose which rung of cameras to sample from (top/mid/bot)
             # this is only because these paths are the most apparently continuous
             which_rung = np.random.randint(0, len(CAMERA_RUNGS))
@@ -462,123 +635,165 @@ class MVHumanNetDataset(Dataset):
             images_permutation = np.roll(np.arange(len(rung_of_cameras)), -start_idx)[:self.num_images]
             images_permutation = [CAMERA_TO_INDEX[rung_of_cameras[i]] for i in images_permutation]
         else: # for set NVS
-            # sample random indices
-            # print("set NVS")
+            # simply uniform sampling of all views
             images_permutation = np.random.choice(len(sampled_image_paths), self.num_images, replace=False)
 
-        if self.fixed_sampling_ids is not None: # overwrite images_permutation
+        # (NOTE: mainly for debugging: overwrites selected samples to a fixed user-defined set)
+        if self.fixed_sampling_ids is not None:
             images_permutation = self.fixed_sampling_ids
 
-        camera_order = [camera_order[i] for i in images_permutation] # ordered subset of 'num_images' sampled cameras
+        # Select subset of multi-view frames (num_images) from the full set of cameras
+        camera_order = [camera_order[i] for i in images_permutation] # ordered subset
         sampled_image_paths = [sampled_image_paths[i] for i in images_permutation]
         sampled_image_mask_paths = [sampled_image_mask_paths[i] for i in images_permutation]
 
-        # Load frames from image paths
-        # (T,3,H',W'), this will be scaled later to 'target_shape'
-        frames = torch.zeros((self.num_images, 3, self.image_shape[0],  self.image_shape[1]))
-        for i, (img_path, mask_path) in enumerate(zip(sampled_image_paths, sampled_image_mask_paths)):
-            image = Image.open(img_path).convert("RGB")
-            img_mask = Image.open(mask_path)
+        return sampled_image_paths, sampled_image_mask_paths, camera_order, images_permutation
 
-            if img_mask.size != image.size: # ensure matching size! (note: 100681 has different sizes!)
-                image = image.resize(img_mask.size, Image.BILINEAR)
-
-            # Create masked image by compositing with black background
-            if self.white_background:
-                background = Image.new('RGB', image.size, (255, 255, 255))
-            else: # black
-                background = Image.new('RGB', image.size, (0, 0, 0))
-
-            masked_image = Image.composite(image, background, img_mask)
-            # Apply transforms after masking
-            # NOTE: if using non-cropped latents, then transforms is just the default as in @dataset.py
-            # masked_image = self.transform(masked_image) # ! moved transform to after random crop
-            frames[i] = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])(masked_image)
-
-        # Sample input/target frame split
+    def _sample_all_masks(self, use_iclight: bool = False, use_infu: bool = False):
+        # * Sample input/target frame split
         if not self.use_inconsistent:
             num_input_frames = np.random.randint(1, self.num_images) # at least 1 input frame
         else:
-            # NOTE: if use_ic, then we make it higher probability that all num_images are inputs
-            # meaning that input_frames_mask will be all 1, and ref_maks will be one-hot
-            # if input_frames_mask is 0 at any point (not max num_images case), then these will have no ic cond.
+            # using IC, make it higher probability that all num_images are inputs
             if np.random.rand() <= self.all_inputs_prob:
-                # more likely to have all inconsistent inputs (then reconstruct to target)
+                # more likely to have all inputs (inconsistent images)
                 num_input_frames = self.num_images
-            else: # 20% chance to have some ic inputs and then new targets
-                num_input_frames = np.random.randint(1, self.num_images) # at least 1 input frame
-        
-        input_frames_indices = np.random.choice(self.num_images, num_input_frames, replace=False) 
+            else:
+                # otherwise, target views without IC are to be predicted (>=1 input frames)
+                num_input_frames = np.random.randint(1, self.num_images)
 
-        # Create input/target masks (1: input/ 0: target)
-        input_frames_mask = torch.zeros(self.num_images, dtype=torch.bool)
-        input_frames_mask[input_frames_indices] = True
+        input_frames_indices = np.random.choice(self.num_images, num_input_frames, replace=False)
+        input_target_mask = torch.zeros(self.num_images, dtype=torch.bool)
+        input_target_mask[input_frames_indices] = True # 1: input, 0: target
 
-        if not self.use_inconsistent: # phase 1
+        # * create ref_mask (one-hot)
+        if not self.use_inconsistent: # not used in our case
             # since inputs are all consistent in dataset, we can use multiple "references"
-            ref_mask = input_frames_mask.clone()
+            ref_mask = input_target_mask.clone()
         else:
-            # inputs will all be inconsistent, and we can only fix to a "single reference"
+            # inputs will all be inconsistent, and we can only fix to a single reference frame
             ref_mask = torch.zeros(self.num_images, dtype=torch.bool)
             fix_frame_idx = input_frames_indices[np.random.choice(len(input_frames_indices), 1).item()]
             ref_mask[fix_frame_idx] = True # this becomes the fixed frame
-            # input_frames_mask = ref_mask.clone()
 
+        # * create masks for inconsistent images from all synthetic sources
+        ic_masks = {}
         if self.use_inconsistent:
-            ic_paths = [path.replace("mv_captures", "relit_images").replace(".jpg", ".png") for path in sampled_image_paths]
-            ic_rgb = []
-            tensorize = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
-            for i, ic_path in enumerate(ic_paths):
+            # based on the input/target mask (only inputs can be sampled)
+            # ic_sampling_prob is the probabiilty of sampling from IC-light over InfU
+            if use_iclight and use_infu:
+                ic_masks['iclight'] = torch.rand(self.num_images) < self.ic_sampling_prob
+                ic_masks['infu'] = ~ic_masks['iclight']
+                # zero-out target frames (these should not have any conditioning)
+                ic_masks['iclight'] = ic_masks['iclight'] * input_target_mask
+                ic_masks['infu'] = ic_masks['infu'] * input_target_mask
+                ic_masks['iclight'][ref_mask] = False
+                ic_masks['infu'][ref_mask] = False
+            elif use_iclight and not use_infu:
+                ic_masks['iclight'] = ~ref_mask * input_target_mask
+                ic_masks['infu'] = torch.zeros(self.num_images, dtype=torch.bool)
+            elif not use_iclight and use_infu:
+                ic_masks['iclight'] = torch.zeros(self.num_images, dtype=torch.bool)
+                ic_masks['infu'] = ~ref_mask * input_target_mask
+            else:
+                raise ValueError(f"use_inconsistent is True, but neither iclight or infu paths are provided!")
+        else:
+            # zero masks indicating no inconsistent frames
+            ic_masks['iclight'] = torch.zeros(self.num_images, dtype=torch.bool)
+            ic_masks['infu'] = torch.zeros(self.num_images, dtype=torch.bool)
+        return input_target_mask, ref_mask, ic_masks
+
+
+    def _load_inconsistent_frames(
+        self, img_paths, img_mask_paths, cam_order, subject_id, timestep,
+        ref_mask, ic_masks):
+        """
+        Replace the sampled MVHN image paths with inconsistent paths (from IC-light and InfU synthetic data).
+        Args:
+            img_paths: list of sampled image paths
+            img_mask_paths: list of sampled image mask paths
+            cam_order: list of camera order
+            subject_id: subject ID
+            timestep: timestep
+            ref_mask: reference mask
+            ic_masks: dictionary of IC-light and InfU masks
+        Returns:
+            ic_rgb: list of actual model input image data (GT, IC-light, InfU)
+            ic_paths: list of actual filepaths to inconsistent images
+        """
+        if not self.use_inconsistent:
+            return torch.zeros((self.num_images, 3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+
+        ic_paths = []
+        # Pre-sample unique InfU indices to avoid duplicates
+        num_infu_frames = ic_masks['infu'].sum().item() if isinstance(ic_masks['infu'], torch.Tensor) else ic_masks['infu'].sum()
+        if ic_masks['infu'].sum() > 0 and num_infu_frames > 0:
+            infu_num_images_in_directory = self.infu_num_images[subject_id]
+            # Sample exactly as many unique indices as we need
+            num_samples = min(num_infu_frames, infu_num_images_in_directory)
+            infu_indices = list(np.random.choice(infu_num_images_in_directory, num_samples, replace=False) + 1)
+        else:
+            infu_indices = []
+        
+        # NOTE: these images are of different sizes/shapes!
+        for path, is_iclight, is_infu, is_ref, camera in zip(img_paths, ic_masks['iclight'], ic_masks['infu'], ref_mask, cam_order):
+            if is_ref:
+                ic_path = path # GT frame
+            elif is_iclight:
+                ic_path = self._get_iclight_path(subject_id, timestep, camera)
+            elif is_infu:
+                # timestep is treated differently for InfU as a random index
+                infu_random_index = infu_indices.pop(0)
+                ic_path = self._get_infu_path(subject_id, f"{infu_random_index:06d}")
+            else: # target frame (no inconsistent frame)
+                ic_path = None
+            ic_paths.append(ic_path)
+
+        ic_rgb = []
+        tensorize = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
+        for ic_path in ic_paths:
+            if ic_path is not None:
                 ic_image = Image.open(ic_path).convert("RGB")
                 ic_rgb.append(tensorize(ic_image)) # these can be different image shapes originally
-            # ! NOTE: only works with IC-light; need to combine with InfU later (combine in filesystem or sample)
-        else: # if not, then just 0 tensor
-            ic_rgb = torch.zeros((self.num_images, 3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+            else: # if not, then just send the 0 tensor
+                ic_rgb.append(torch.zeros((3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32))
+        return ic_rgb, ic_paths
 
-
-        camera_mask = torch.ones(self.num_images, dtype=torch.bool)
-
-        def get_c2w(cam):
-            tf_matrix = create_transform_matrix(
-                np.array(extrinsics[cam]['rotation']),
-                np.array(extrinsics[cam]['translation']) * camera_scale,
-                homogeneous=True
-            )
-
-            return np.linalg.inv(tf_matrix) # w2c -> c2w
-
-        # Read extrinsics (w2c -> c2w)
-        all_c2ws = np.array([
-            get_c2w(cam) for cam in frames_info.keys() # these keys are SORTED
-        ])
-
-        all_c2ws = torch.from_numpy(all_c2ws).float() # (total_cameras=48, 4, 4)
-        c2ws = all_c2ws[images_permutation]    # choose previously sampled ones only (NOTE: order is unknown right now, need to edit!)
-        center_cameras(all_c2ws, c2ws)  # mean center
-        scale_cameras(c2ws)
-
+    def _crop_and_transform_frames_and_intrinsics(
+        self, frames_info, frames, image_masks, ic_rgb, subject_id, cam_order, intrinsics, ref_mask, ic_masks, sapiens_conditionings):
+        """
+        Crop and transform frames while updating intrinsics as needed.
+        Args:
+            frames: list of frames
+            ic_rgb: list of inconsistent frames
+            cam_order: list of camera order
+        """
         # create intrinsics tensor, update intrinsics
         if self.random_crop or self.maximal_crop:
-            annots_jsons = [frames_info[cam]["annots"] for cam in camera_order]
+            annots_jsons = [frames_info[cam]["annots"] for cam in cam_order]
             crop_params = []
+            face_bboxes_adjusted = []
             for annots_json in annots_jsons:
                 bbox = annots_json['bbox'][:4]
-                face_bbox = annots_json['bbox_face'][:4]
-                crop_params.append((bbox, face_bbox))
+                face_bbox = annots_json['bbox_face'][:4] if self.face_bboxes is not None else [-1, -1, -1, -1] # this is from facebbox dir
+                crop_params.append(bbox)
+                face_bboxes_adjusted.append(face_bbox)
             # account for mvhn downsampling (hence the 0.5)
             # ! big HACK: after 103000+, the annotations are not scaled by 0.5 anymore!
             bbox_annot_scale = 0.5 if int(subject_id) < 103000 else 1.0
-            bbox_params = torch.stack([torch.tensor(bbox) * bbox_annot_scale for bbox, _ in crop_params])
-            # face_params = torch.stack([torch.tensor(face_bbox) * 0.5 for _, face_bbox in crop_params])
-            # apparently, face bbox data isn't really        
-            # crop_config = {
-            #     "center_mean": torch.mean(face_params.reshape(-1,2,2).permute(0,2,1), dim=2),
-            # }
-            frames, Ks, rel_bbox = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float())
+            bbox_params = torch.stack([torch.tensor(bbox) * bbox_annot_scale for bbox in crop_params])
+
+            face_params = torch.stack([torch.tensor(face_bbox) for face_bbox in face_bboxes_adjusted]) if self.face_bboxes is not None else torch.stack([torch.tensor([-1, -1, -1, -1]) for _ in range(self.num_images)])
+            frames, Ks, rel_bbox, face_bboxes_result, new_bbox, bbox_before_pad = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=face_params)
+            # ! this is bugged; ensure that padding is correctly done 
+            image_masks, _ = self.cropper._possibly_pad_img(image_masks.unsqueeze(1), bbox_before_pad[:,0], bbox_before_pad[:,1], bbox_before_pad[:,2], bbox_before_pad[:,3])
+            image_masks = self.cropper.crop_images(image_masks, new_bbox[:,0], new_bbox[:,1], new_bbox[:,2], new_bbox[:,3])
+            if face_bboxes_result is not None:
+                face_bboxes_adjusted = face_bboxes_result
             # NOTE: rel_bbox is the delta from the deterministic crop to the random crop
             # this would then be all 0 if not using random_crop
             # for ic-light, we would later need to scale these by the scale factor (1024->576)
-            
+
             # later, we resize using transform, so we update cropped intrinsics here accordingly
             scale = np.array([self.target_shape[0] / cropped_img.shape[-2] for cropped_img in frames])
             Ks = update_intrinsics_resize(Ks, scale)
@@ -597,64 +812,304 @@ class MVHumanNetDataset(Dataset):
             Ks = repeat(Ks, 'd1 d2 -> n d1 d2', n=self.num_images) # assumes all intrinsics are the same 
             Ks = torch.from_numpy(Ks).float()
 
+            # if self.use_sapiens_conditioning is not None:
+            #     for cond, is_ref in zip(sapiens_conditionings, ref_mask):
+            #         for cond_tensor in sapiens_conditionings[cond]:
+            #             if is_ref: # crop first (for MVHN seg/depth maps)
+            #                 cond_tensor = cond_tensor[crop_amount:self.target_shape[0]-crop_amount, :]
+            #             cond_tensor = torch.nn.functional.interpolate(cond_tensor.unsqueeze(0), size=(self.target_shape[0], self.target_shape[1]), mode='bilinear', align_corners=False).squeeze(0)
+
+            # face bboxes can be found
+            annots_jsons = [frames_info[cam]["annots"] for cam in cam_order]
+            face_bboxes_adjusted = []
+            for annots_json in annots_jsons:
+                face_bbox = annots_json['bbox_face'][:4] # this is from facebbox dir
+                face_bboxes_adjusted.append(face_bbox)
+                if face_bbox != [-1, -1, -1, -1]:
+                    # x1,x2 are affected by the center crop
+                    # ! assumes center crop is always horizontal (HARDCODED)
+                    face_bbox[0] = face_bbox[0] - crop_amount
+                    face_bbox[2] = face_bbox[2] - crop_amount
+            # account for mvhn downsampling (hence the 0.5)
+            # ! big HACK: after 103000+, the annotations are not scaled by 0.5 anymore!
+            face_params = torch.stack([torch.tensor(face_bbox) for face_bbox in face_bboxes_adjusted])
+            face_bboxes_adjusted = face_params * scale_amount
+
+        # * actual cropping
         # NOTE: the behavior of transform will change depending on whether random crop is used
         # frames = [self.transform(frame) for frame in frames]
         if self.random_crop or self.maximal_crop:
             frames = [self.transform(frame) for frame in frames]
             frames = torch.stack(frames, dim=0)
+            image_masks = [self.mask_transform(img_mask) for img_mask in image_masks]
+            image_masks = torch.stack(image_masks, dim=0)
+            
             ic_rgb_tensor = torch.zeros((self.num_images, 3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
-            for i, (ic_image, bbox) in enumerate(zip(ic_rgb, rel_bbox)):
+            for i, (ic_image, bbox, is_ref, is_iclight, is_infu) in enumerate(zip(ic_rgb, rel_bbox, ref_mask, ic_masks['iclight'], ic_masks['infu'])):
                 # First resize ic_image to target shape
                 ic_image = torch.nn.functional.interpolate(ic_image.unsqueeze(0), size=(self.target_shape[0], self.target_shape[1]), mode='bilinear', align_corners=False).squeeze(0)
                 dx1, dy1, dx2, dy2 = bbox.int()
                 ic_image_ = ic_image[:,0+dy1:self.target_shape[0]+dy2, 0+dx1:self.target_shape[1]+dx2] # crop
                 ic_image_ = self.transform(ic_image_)
                 ic_rgb_tensor[i] = ic_image_
+
+                # same for the sapiens conditionings
+                if self.use_sapiens_conditioning is not None:
+                    # only the ref images are cropped in this way
+                    ref_idx = torch.where(ref_mask == True)[0][0].item()
+                    for cond in self.use_sapiens_conditioning:
+                        cond_tensor = sapiens_conditionings[cond][i]
+                        if ref_idx == i:
+                            # if MVHN, crop using new_bbox 
+                            padded_img, refbbox = self.cropper._possibly_pad_img(
+                                cond_tensor.unsqueeze(0), 
+                                new_bbox[ref_idx][0].unsqueeze(0), 
+                                new_bbox[ref_idx][1].unsqueeze(0), 
+                                new_bbox[ref_idx][2].unsqueeze(0), 
+                                new_bbox[ref_idx][3].unsqueeze(0)
+                            )
+                            if isinstance(padded_img, list):
+                                padded_img = padded_img[0]
+                            else:
+                                padded_img = padded_img.squeeze(0)
+                            refbbox = refbbox.squeeze(0).int()
+                            cropped = padded_img[:, refbbox[1]:refbbox[3], refbbox[0]:refbbox[2]]
+                            sapiens_conditionings[cond][ref_idx] = T.Resize((self.target_shape[0], self.target_shape[1]))(cropped)
+                        else:
+                            # if IClight/InfU, crop and resize (but NO normalize)
+                            scale = cond_tensor.shape[-2] / self.target_shape[0]
+                            cropped_cond_tensor = cond_tensor[:, 0+int(dy1*scale):int((self.target_shape[0]+dy2)*scale), 0+int(dx1*scale):int((self.target_shape[1]+dx2)*scale)]
+                            sapiens_conditionings[cond][i] = T.Resize((self.target_shape[0], self.target_shape[1]))(cropped_cond_tensor)
+                        if cond == "seg_masks":
+                            sapiens_conditionings[cond][i] = one_hot_encode_segmentation(sapiens_conditionings[cond][i], 28)
+
+            sapiens_conditionings = {cond: torch.stack(cond_tensor, dim=0) for cond, cond_tensor in sapiens_conditionings.items()}
             ic_rgb = ic_rgb_tensor
-        else: # center crop + resize only
+        else: # center crop + resize only (NOTE: set transform=None for this default behavior)
             frames = self.transform(frames)
             ic_rgb = [self.transform(ic_image) for ic_image in ic_rgb] # do the same thing as frames
             ic_rgb = torch.stack(ic_rgb, dim=0)
+            image_masks = self.mask_transform(image_masks)
+            image_masks = torch.stack(image_masks, dim=0)
+
             # frames = torch.stack(frames, dim=0) # resize to 576x576 normalized [-1, 1] image tensors
+            if self.use_sapiens_conditioning is not None:
+                for cond in self.use_sapiens_conditioning:
+                    for is_ref, cond_tensor in zip(ref_mask, sapiens_conditionings[cond]):
+                        cond_tensor = T.Resize((self.target_shape[0], self.target_shape[1]))(cond_tensor) # both follows this old behavior
+                        if cond == "seg_masks":
+                            cond_tensor = one_hot_encode_segmentation(cond_tensor, 28)
+            sapiens_conditionings = {cond: torch.stack(cond_tensor, dim=0) for cond, cond_tensor in sapiens_conditionings.items()}
 
-        # load latents if we provided a path
-        if self.latents_dir is not None and os.path.exists(os.path.join(self.latents_dir, subject_id, f"{subject_id}.npz")) and not self.maximal_crop:
-            npz_file = os.path.join(self.latents_dir, subject_id, f"{subject_id}.npz")
-            # npz_data = np.load(npz_file) # this is already for the current subject
-            with np.load(npz_file) as npz_data:
-                latent_tensors = [npz_data[f"{sample_cam}.{timestep}"] for sample_cam in camera_order]
-                clean_latents = torch.stack([torch.from_numpy(latent_tensor) for latent_tensor in latent_tensors]) # (B, 4, 72, 72)
-        else: # encode frames on the fly (DO NOT DO THIS IN DATASET)
-            clean_latents = 0  # just use 'frames' (already pre-masked and cropped) in SevaWrapper
-            # clean_latents = torch.zeros((self.num_images, 4, self.target_shape[0], self.target_shape[1]))
+        return frames, image_masks, ic_rgb, Ks, sapiens_conditionings, face_bboxes_adjusted
 
-        w2cs = torch.linalg.inv(c2ws)
-        pluckers = get_plucker_coordinates(
-            extrinsics_src=w2cs[input_frames_indices[0]],
+    def _get_arcface_embeddings(self, subject_id, timestep, cam_order, input_target_mask, ref_mask, ic_masks):
+        arcface_embeddings = []
+        if self.arcface_embeddings_dir is not None:
+            for is_ref, is_iclight, is_infu, cam in zip(ref_mask, ic_masks['iclight'], ic_masks['infu'], cam_order):   
+                try:
+                    if is_ref: # not implemented yet
+                        arcface_embedding = self._read_arcface_embeddings("mvhn", subject_id, cam, f"{timestep}_img.jpg")
+                    elif is_infu:
+                        arcface_embedding = self._read_arcface_embeddings("infu", subject_id, cam, f"{timestep}_img.png")
+                    elif is_iclight: # is iclight
+                        arcface_embedding = self._read_arcface_embeddings("iclight", subject_id, cam, f"{timestep}_img.png")
+                    else:
+                        arcface_embedding = None
+                except KeyError:
+                    arcface_embedding = None
+                except Exception as e:
+                    print(f"Error reading arcface embedding: {e}")
+                    arcface_embedding = None
+                arcface_embeddings.append(arcface_embedding)
+            
+            # Convert to tensor [T, 512]
+            # Handle None values by replacing with zeros
+            arcface_embeddings = [
+                torch.tensor(emb) if emb is not None else torch.zeros(512, dtype=torch.float32)
+                for emb in arcface_embeddings
+            ]
+            arcface_embeddings = torch.stack(arcface_embeddings)
+            arcface_embeddings[~input_target_mask] *= 0
+            # don't use arcface embedding for target frames
+            # NOTE: it's possible that we can just average all of these out
+            # to get the average face embedding (which proves to be effective in the InstantID paper)
+        else: # zero tensor
+            arcface_embeddings = torch.zeros((self.num_images, 512), dtype=torch.float32)
+        
+        return arcface_embeddings
+
+    def _get_sapiens_conditionings(self, subject_id, timestep, cam_order, ic_paths, input_target_mask, ref_mask, ic_masks):
+        """
+        Get sapiens conditionings.
+        Args:
+            subject_id: subject ID
+            timestep: timestep
+            cam_order: list of camera order
+        """
+         # get sapiens conditionings; NOTE: these are of original image size (need to crop later)
+        sapiens_conditionings = {}
+        if self.use_sapiens_conditioning is not None:
+            for cond in self.use_sapiens_conditioning:
+                sapiens_conditionings[cond] = []
+                for is_ref, is_iclight, is_infu, camera, ic_path in zip(ref_mask, ic_masks['iclight'], ic_masks['infu'], cam_order, ic_paths):
+                    try: 
+                        cond_tensor = None
+                        if is_ref:
+                            # The reference frame always uses MVHN ground truth
+                            cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="mvhn")
+                        elif is_iclight: 
+                            cond_tensor = self._sapiens_get(cond, subject_id, camera, timestep, dataset_type="iclight")
+                        else: # infu
+                            cond_tensor = self._sapiens_get(cond, subject_id, camera, f"{os.path.basename(ic_path).split('_')[0]}", dataset_type="infu")
+
+                        cond_tensor = torch.nan_to_num(cond_tensor, nan=0) # masks have 'nan' as background values
+                    except Exception as e:
+                        pass
+                    if cond_tensor is None:
+                        if cond == "depth":
+                            cond_tensor = torch.zeros((1, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+                        elif cond == "seg_masks":
+                            # expand later using one_hot_encode_segmentation (in crop_and_transform_frames_and_intrinsics)
+                            # refactor and decouple later 
+                            cond_tensor = torch.zeros((1, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+                        elif cond == "latents":
+                            cond_tensor = torch.zeros((4, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
+                    else:
+                        cond_tensor = cond_tensor.unsqueeze(0)
+                    sapiens_conditionings[cond].append(cond_tensor)
+        return sapiens_conditionings
+
+
+    def __len__(self):
+        return len(self.scenes)
+    
+    def __getitem__(self, idx):
+        """
+        Collect multi-views + conditioning data for a scene at a fixed timestep,
+        preprocess for training loop.
+        """
+        scene = self.scenes[idx] # get scene content info
+        subject_id = scene['subject_id'] # ex. 100001
+        timestep = scene['timestep'] # ex. 0005
+        frames_info = dict(sorted(scene['frames_info'].items())) # camera dict data (annots)
+        subject_path = os.path.join(self.root_dir, subject_id)
+
+        # get camera parameters
+        extrinsics = self.cam_params[subject_id]['extrinsics']
+        intrinsics = np.array(self.cam_params[subject_id]['intrinsics'])
+        camera_scale = self.cam_params[subject_id]['camera_scale'] 
+
+        if self.pre_scale_intrinsics != 1:
+            # update intrinsics (required for MVHumanNet; default 0.5x prescaling)
+            intrinsics = update_intrinsics_resize(intrinsics, scale=self.pre_scale_intrinsics)
+
+        # Sample multi-view frame + subject mask indices (as string paths)
+        img_paths, img_mask_paths, cam_order, sample_permutation = self._sample_multiview_image_paths(frames_info)
+        
+        # generate masks for input/target frames split, reference frame, and IC/InfU frames
+        input_target_mask, ref_mask, ic_masks = self._sample_all_masks(
+            use_iclight=self.iclight_dataset_path is not None,
+            use_infu=self.infu_dataset_path is not None,
+        )
+        iclight_mask = ic_masks["iclight"]
+        infu_mask = ic_masks["infu"]
+
+        # load raw GT frames from MVHN
+        frames, image_masks = self._load_raw_frames(img_paths, img_mask_paths)
+
+        # loads inconsistent frames from IC-light and InfU synthetic data
+        ic_rgb, ic_paths = self._load_inconsistent_frames(
+            img_paths, img_mask_paths, cam_order,
+            subject_id, timestep, ref_mask, ic_masks
+        )
+
+        # arcface conditionings
+        arcface_embeddings = self._get_arcface_embeddings(
+            subject_id, timestep, cam_order, input_target_mask, ref_mask, ic_masks
+        )
+
+        # sapiens conditionings
+        sapiens_conditionings = self._get_sapiens_conditionings(
+            subject_id, timestep, cam_order, ic_paths, input_target_mask, ref_mask, ic_masks
+        )
+
+        # transform GT and inconsistent frames + intrinsics to desired shape
+        # do these (special) crops for the synthetic data as well
+        frames, img_masks, ic_rgb, Ks, sapiens_conditionings, face_bboxes_adjusted = self._crop_and_transform_frames_and_intrinsics(
+            frames_info, frames, image_masks, ic_rgb,
+            subject_id, cam_order, intrinsics,
+            ref_mask, ic_masks, sapiens_conditionings
+        )
+        img_masks = img_masks / 255.0 # convert to [0, 1]
+
+        # this will always be constant 1-tensor (according to pretrained model authors)
+        camera_mask = torch.ones(self.num_images, dtype=torch.bool)
+
+        def get_c2w(cam):
+            tf_matrix = create_transform_matrix(
+                np.array(extrinsics[cam]['rotation']),
+                np.array(extrinsics[cam]['translation']) * camera_scale,
+                homogeneous=True
+            )
+
+            return np.linalg.inv(tf_matrix) # w2c -> c2w
+
+        # Read extrinsics (w2c -> c2w) to fit SEVA camera convention
+        all_c2ws = np.array([
+            get_c2w(cam) for cam in frames_info.keys() # these keys are SORTED
+        ])
+
+        all_c2ws = torch.from_numpy(all_c2ws).float() # (total_cameras=48, 4, 4)
+        c2ws = all_c2ws[sample_permutation] # extrinsics for sampled cameras
+        center_cameras(all_c2ws, c2ws) # mean center
+        scale_cameras(c2ws)
+
+        # plucker coordinates for all cameras
+        w2cs = torch.linalg.inv(c2ws) # c2w -> w2c
+        # Find the first input frame (first True in input_target_mask) to use as source camera
+        # argmax returns the first True index, or 0 if all False
+        src_camera_idx = input_target_mask.to(torch.int).argmax().item()
+        pluckers = get_plucker_coordinates( # relative to the first camera in the sample
+            extrinsics_src=w2cs[src_camera_idx],
             extrinsics=w2cs,
             intrinsics=Ks.clone(),
             target_size=(self.target_shape[0] // self.downsample_factor, 
                          self.target_shape[1] // self.downsample_factor),
         )
 
+        # load preloaded latents if provided (mostly deprecated)
+        if self.latents_dir is not None and os.path.exists(os.path.join(self.latents_dir, subject_id, f"{subject_id}.npz")) and not self.maximal_crop:
+            npz_file = os.path.join(self.latents_dir, subject_id, f"{subject_id}.npz")
+            # npz_data = np.load(npz_file) # this is already for the current subject
+            with np.load(npz_file) as npz_data:
+                latent_tensors = [npz_data[f"{sample_cam}.{timestep}"] for sample_cam in cam_order]
+                clean_latents = torch.stack([torch.from_numpy(latent_tensor) for latent_tensor in latent_tensors]) # (B, 4, 72, 72)
+        else: # else encode frames on the fly (loaded in diffusion.py)
+            clean_latents = 0 # indicates to diffusion.py to encode on the fly
+
+
         concat = torch.cat( # binary masks (inp/tgt + ref) and pluckers
             [
                 repeat(
-                    input_frames_mask,
+                    input_target_mask,
                     "n -> n 1 h w",
                     h=pluckers.shape[2],
                     w=pluckers.shape[3],
                 ),
+                pluckers,
                 repeat(
                     ref_mask, 
                     "n -> n 1 h w", 
                     h=pluckers.shape[2],
                     w=pluckers.shape[3] 
                 ),
-                pluckers,
             ],
             dim=1,
         ) # (T, 6 + 1, 72, 72), where 6 is for plucker coords and 1 for binary mask
+
+        # Why sapiens cond not in concat? => needs to be processed extra via a projection layer
+        # then, in diffusion.py, we process and concatenate over there
 
         if type(clean_latents) == int and clean_latents == 0:
             replace = 0
@@ -685,20 +1140,30 @@ class MVHumanNetDataset(Dataset):
             # - replace gets updated
             output_dict = {
                 "clean_latent": clean_latents, # unscaled clean latents
-                "mask": input_frames_mask,
+                "mask": input_target_mask,
                 "ref_mask": ref_mask, # "one hot" mask for reference images 
-                # "ic_paths": ic_paths, # synthetic data paths
                 "ic_rgb": ic_rgb, # ! NOTE: normalized!
-                # "ic_bbox": rel_bbox, # for cropping ic latents
                 "plucker": pluckers,
                 "camera_mask": camera_mask,
                 "concat": concat,
-                "frames": frames,
+                "frames": frames,  # transformed frames (post-cropping, normalized)
+                "frames_masks": img_masks, # corresponding masks
                 "replace": replace, # contains pre-scaled clean latents!
                 "c2w": c2ws,
                 "K": Ks,
-                "use_inconsistent": self.use_inconsistent
+                "use_inconsistent": self.use_inconsistent,
+                "face_bbox": face_bboxes_adjusted,  # Face bounding boxes [T, 4] in pixel coords (x1, y1, x2, y2)
+                # NOTE: face_bbox is w.r.t post-cropping, resized 576^2 image!
             }
+            # NOTE: sapiens conditioning will be processed internally to 
+
+            # Add ArcFace embeddings if available
+            if self.arcface_embeddings_dir is not None:
+                output_dict["arcface_embedding"] = arcface_embeddings  # [T, 512]
+                # where None values are replaced with zero tensor
+
+            if self.use_sapiens_conditioning is not None:
+                output_dict["sapiens_conditioning"] = sapiens_conditionings
         except Exception as e:
             print(f"Error creating output_dict: {e}")
             raise
@@ -731,13 +1196,19 @@ class MVHumanNetLoader(pl.LightningDataModule):
         exclude: list = None,
         step_size: int = 150,
         preload_path: str = None,
-        synthetic_dataset_path: str = None,
+        iclight_dataset_path: str = None,
+        infu_dataset_path: str = None,
+        face_bbox_dir: str = None,
+        arcface_embeddings_dir: str = None,
         random_crop: bool = False,
         maximal_crop: bool = True,
         val_include: list = None,
         use_inconsistent: bool = False,
         random_crop_prob: float = 0.3,
-        fixed_sampling_ids: list = None
+        ic_sampling_prob: float = 0.7,
+        fixed_sampling_ids: list = None,
+        use_sapiens_conditioning: list = None,
+        sapiens_segmentation_channels_to_use: list = None,
     ):
         super().__init__()
         print("init of DATALOADER")
@@ -752,13 +1223,19 @@ class MVHumanNetLoader(pl.LightningDataModule):
         self.exclude = exclude
         self.step_size = step_size
         self.preload_path = preload_path
-        self.synthetic_dataset_path = synthetic_dataset_path
+        self.iclight_dataset_path = iclight_dataset_path
+        self.infu_dataset_path = infu_dataset_path
+        self.face_bbox_dir = face_bbox_dir
+        self.arcface_embeddings_dir = arcface_embeddings_dir
         self.random_crop = random_crop
         self.maximal_crop = maximal_crop
         self.val_include = val_include
         self.use_inconsistent = use_inconsistent
         self.random_crop_prob = random_crop_prob
+        self.ic_sampling_prob = ic_sampling_prob
         self.fixed_sampling_ids = fixed_sampling_ids
+        self.use_sapiens_conditioning = use_sapiens_conditioning
+        self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
         # Define transforms
         # self.transform = T.Compose([
         #     T.Resize(image_size), # whatever final resolution we want here
@@ -771,6 +1248,12 @@ class MVHumanNetLoader(pl.LightningDataModule):
                     self.only_include = [line.strip() for line in f]
             else:
                 self.only_include = expand_only_include(self.only_include)
+        if isinstance(self.exclude, str): # in the format ex: "100001-102000,102020-104000"
+            if os.path.exists(self.exclude): # if passed in a file (subject numbers on each line)
+                with open(self.exclude, 'r') as f:
+                    self.exclude = [line.strip() for line in f]
+            else:
+                self.exclude = expand_only_include(self.exclude)
         if isinstance(self.val_include, str): # in the format ex: "100001-102000,102020-104000"
             if os.path.exists(self.val_include): # if passed in a file (subject numbers on each line)
                 with open(self.val_include, 'r') as f:
@@ -793,12 +1276,18 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 exclude=self.exclude,
                 step_size=self.step_size,
                 preload_path=self.preload_path,
-                synthetic_dataset_path=self.synthetic_dataset_path,
+                iclight_dataset_path=self.iclight_dataset_path,
+                infu_dataset_path=self.infu_dataset_path,
+                face_bbox_dir=self.face_bbox_dir,
+                arcface_embeddings_dir=self.arcface_embeddings_dir,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
                 random_crop_prob=self.random_crop_prob,
+                ic_sampling_prob=self.ic_sampling_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
+                use_sapiens_conditioning=self.use_sapiens_conditioning,
+                sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
             )
 
         if stage == "validate" or stage is None:
@@ -813,12 +1302,18 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 exclude=self.exclude,
                 step_size=self.step_size, # don't want too many samples for validation set
                 preload_path=self.preload_path,
-                synthetic_dataset_path=self.synthetic_dataset_path,
+                iclight_dataset_path=self.iclight_dataset_path,
+                infu_dataset_path=self.infu_dataset_path,
+                face_bbox_dir=self.face_bbox_dir,
+                arcface_embeddings_dir=self.arcface_embeddings_dir,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
+                ic_sampling_prob=self.ic_sampling_prob,
                 random_crop_prob=self.random_crop_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
+                use_sapiens_conditioning=self.use_sapiens_conditioning,
+                sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
             )
         if stage == "test" or stage is None:
             self.test_dataset = MVHumanNetDataset(
@@ -831,12 +1326,18 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 exclude=self.exclude,
                 step_size=self.step_size,
                 preload_path=self.preload_path,
-                synthetic_dataset_path=self.synthetic_dataset_path,
+                iclight_dataset_path=self.iclight_dataset_path,
+                infu_dataset_path=self.infu_dataset_path,
+                face_bbox_dir=self.face_bbox_dir,
+                arcface_embeddings_dir=self.arcface_embeddings_dir,
                 random_crop=self.random_crop,
                 maximal_crop=self.maximal_crop,
                 use_inconsistent=self.use_inconsistent,
+                ic_sampling_prob=self.ic_sampling_prob,
                 random_crop_prob=self.random_crop_prob,
                 fixed_sampling_ids=self.fixed_sampling_ids,
+                use_sapiens_conditioning=self.use_sapiens_conditioning,
+                sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
             )
             
     def prepare_data(self):
@@ -851,8 +1352,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=True,
             pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2
+            persistent_workers=True if self.num_workers > 0 else False,
+            prefetch_factor=2 if self.num_workers > 0 else None
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -868,8 +1369,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=True,
             pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2
+            persistent_workers=True if self.num_workers > 0 else False,
+            prefetch_factor=2 if self.num_workers > 0 else None
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -880,6 +1381,6 @@ class MVHumanNetLoader(pl.LightningDataModule):
             num_workers=self.num_workers,
             drop_last=True,
             pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2
+            persistent_workers=True if self.num_workers > 0 else False,
+            prefetch_factor=2 if self.num_workers > 0 else None
         )

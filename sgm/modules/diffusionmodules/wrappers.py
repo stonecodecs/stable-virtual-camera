@@ -61,13 +61,18 @@ class SevaWrapper(IdentityWrapper):
 
         t = repeat(t, "b -> (b f)", f=f)
         y = repeat(c["crossattn"], "b 1 c -> (b f) 1 c", f=f)
+        if "face_cond" in c:
+            face_context = c["face_cond"].flatten(end_dim=1)
+        else:
+            face_context = None
 
         out = self.diffusion_model(
             x,
             t=t,
             y=y,
             dense_y=dense_y,
-            num_frames=f
+            num_frames=f,
+            face_context=face_context,
             # **kwargs,
         )
         out = rearrange(out, "(b f) c h w -> b f c h w", f=f)
