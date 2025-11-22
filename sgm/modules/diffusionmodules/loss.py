@@ -60,6 +60,7 @@ class StandardDiffusionLoss(nn.Module):
         face_weighting: float = 0.0,
         arcface_loss_weight: float = 0.0,
         arcface_gt_key: str = "arcface_embedding",
+        background_downweight: float = 0.0,
         **kwargs, # absorb unknown keys
     ):
         super().__init__()
@@ -75,6 +76,7 @@ class StandardDiffusionLoss(nn.Module):
         # 0.0 -> no extra face weighting, spatially uniform loss weighting
         self.arcface_loss_weight = arcface_loss_weight
         self.arcface_gt_key = arcface_gt_key
+        self.background_downweight = background_downweight
 
         # Store reference to first_stage_model for RGB decoding (set externally)
         self.first_stage_model = None
@@ -288,7 +290,7 @@ class StandardDiffusionLoss(nn.Module):
             loss_mask = F.interpolate(
                 loss_mask.flatten(start_dim=0, end_dim=1), size=model_output.shape[-2:], mode='bilinear'
             ).unflatten(dim=0, sizes=model_output.shape[:2])
-            loss_mask = torch.clamp(loss_mask, min=0.01, max=1.0).float() # downweight background by 100x (but not zero!)
+            loss_mask = torch.clamp(loss_mask, min=self.background_downweight, max=1.0).float() # downweight background by 100x (but not zero!)
  
         if self.loss_type == "l2":
             spatial_loss = w * (model_output - target) ** 2 * loss_mask# [B, T, C, H, W]
