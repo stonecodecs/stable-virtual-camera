@@ -188,6 +188,19 @@ class RandomBBoxCropper(object):
         else:
             return images, torch.stack([x1, y1, x2, y2], dim=1)
 
+    def crop_images(self, images, x1, y1, x2, y2):
+        """
+        Crop images based on bounding box.
+        """
+        cropped_images = []
+        for i in range(len(images)):
+            if len(images[i].shape) == 2:
+                cropped_img = images[i][int(y1[i]):int(y2[i]), int(x1[i]):int(x2[i])]
+            else:
+                cropped_img = images[i][:, int(y1[i]):int(y2[i]), int(x1[i]):int(x2[i])]
+            cropped_images.append(cropped_img)
+        return cropped_images
+
     def __call__(
         self, 
         images: torch.Tensor, 
@@ -247,12 +260,8 @@ class RandomBBoxCropper(object):
             face_bboxes_new = face_bboxes_new.to(torch.int32)  # Convert back to int32 for indexing
 
         # perform the actual crop
-        cropped_images = []
-        for i in range(len(images)):
-            cropped_img = images[i][:, int(y1[i]):int(y2[i]), int(x1[i]):int(x2[i])]
-            cropped_images.append(cropped_img)
-
-        return cropped_images, K_new, rel_bbox, face_bboxes_new if face_bboxes is not None else None, bbox
+        cropped_images = self.crop_images(images, x1, y1, x2, y2)
+        return cropped_images, K_new, rel_bbox, face_bboxes_new if face_bboxes is not None else None, bbox.int()
 
 
 def percent_to_absolute(arr, abs_arr):

@@ -253,6 +253,11 @@ class MVHumanNetDataset(Dataset):
                 T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)]),                      # Convert to tensor
                 T.Normalize([0.5], [0.5])          # Normalize to [-1, 1]
             ])
+            self.mask_transform = T.Compose([
+                T.CenterCrop(self.image_shape[0]), # Center crop to square
+                T.Resize(self.target_shape),       # Resize to target shape
+                T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)]),  # Convert to tensor, keep in [0, 1]
+            ])
 
         if self.random_crop or self.maximal_crop:
             self.cropper = RandomBBoxCropper(
@@ -264,6 +269,10 @@ class MVHumanNetDataset(Dataset):
                 T.Resize(self.target_shape),
                 T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)]),
                 T.Normalize([0.5], [0.5])
+            ])
+            self.mask_transform = T.Compose([
+                T.Resize(self.target_shape),       # Resize to target shape
+                T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)]),  # Convert to tensor, keep in [0, 1]
             ])
 
         if self.pre_scale_intrinsics != 0.5:
@@ -578,6 +587,7 @@ class MVHumanNetDataset(Dataset):
         No transform is applied except if needing to resize to expected input shape.
         """
         frames = torch.zeros((self.num_images, 3, self.image_shape[0],  self.image_shape[1]))
+        img_masks = torch.zeros((self.num_images, self.image_shape[0], self.image_shape[1]))
         for i, (img_path, mask_path) in enumerate(zip(image_paths, mask_paths)):
             image = Image.open(img_path).convert("RGB")
             img_mask = Image.open(mask_path)
@@ -592,8 +602,9 @@ class MVHumanNetDataset(Dataset):
 
             masked_image = Image.composite(image, background, img_mask)
             frames[i] = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])(masked_image)
+            img_masks[i] = T.Compose([T.ToImage()])(img_mask)
             del image, img_mask, masked_image # free PIL images
-        return frames
+        return frames, img_masks
 
     def _sample_multiview_image_paths(self, frames_info: dict, use_iclight: bool = False, use_infu: bool = False) -> Tuple[list[str], list[str], list[str]]:
         """
@@ -749,7 +760,7 @@ class MVHumanNetDataset(Dataset):
         return ic_rgb, ic_paths
 
     def _crop_and_transform_frames_and_intrinsics(
-        self, frames_info, frames, ic_rgb, subject_id, cam_order, intrinsics, ref_mask, ic_masks, sapiens_conditionings):
+        self, frames_info, frames, image_masks, ic_rgb, subject_id, cam_order, intrinsics, ref_mask, ic_masks, sapiens_conditionings):
         """
         Crop and transform frames while updating intrinsics as needed.
         Args:
@@ -774,6 +785,8 @@ class MVHumanNetDataset(Dataset):
 
             face_params = torch.stack([torch.tensor(face_bbox) for face_bbox in face_bboxes_adjusted]) if self.face_bboxes is not None else torch.stack([torch.tensor([-1, -1, -1, -1]) for _ in range(self.num_images)])
             frames, Ks, rel_bbox, face_bboxes_result, new_bbox = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=face_params)
+            image_masks, _ = self.cropper._possibly_pad_img(image_masks.unsqueeze(1), new_bbox[:,0], new_bbox[:,1], new_bbox[:,2], new_bbox[:,3])
+            image_masks = self.cropper.crop_images(image_masks, new_bbox[:,0], new_bbox[:,1], new_bbox[:,2], new_bbox[:,3])
             if face_bboxes_result is not None:
                 face_bboxes_adjusted = face_bboxes_result
             # NOTE: rel_bbox is the delta from the deterministic crop to the random crop
@@ -827,6 +840,9 @@ class MVHumanNetDataset(Dataset):
         if self.random_crop or self.maximal_crop:
             frames = [self.transform(frame) for frame in frames]
             frames = torch.stack(frames, dim=0)
+            image_masks = [self.mask_transform(img_mask) for img_mask in image_masks]
+            image_masks = torch.stack(image_masks, dim=0)
+            
             ic_rgb_tensor = torch.zeros((self.num_images, 3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32)
             for i, (ic_image, bbox, is_ref, is_iclight, is_infu) in enumerate(zip(ic_rgb, rel_bbox, ref_mask, ic_masks['iclight'], ic_masks['infu'])):
                 # First resize ic_image to target shape
@@ -872,6 +888,9 @@ class MVHumanNetDataset(Dataset):
             frames = self.transform(frames)
             ic_rgb = [self.transform(ic_image) for ic_image in ic_rgb] # do the same thing as frames
             ic_rgb = torch.stack(ic_rgb, dim=0)
+            image_masks = self.mask_transform(image_masks)
+            image_masks = torch.stack(image_masks, dim=0)
+
             # frames = torch.stack(frames, dim=0) # resize to 576x576 normalized [-1, 1] image tensors
             if self.use_sapiens_conditioning is not None:
                 for cond in self.use_sapiens_conditioning:
@@ -881,7 +900,7 @@ class MVHumanNetDataset(Dataset):
                             cond_tensor = one_hot_encode_segmentation(cond_tensor, 28)
             sapiens_conditionings = {cond: torch.stack(cond_tensor, dim=0) for cond, cond_tensor in sapiens_conditionings.items()}
 
-        return frames, ic_rgb, Ks, sapiens_conditionings, face_bboxes_adjusted
+        return frames, image_masks, ic_rgb, Ks, sapiens_conditionings, face_bboxes_adjusted
 
     def _get_arcface_embeddings(self, subject_id, timestep, cam_order, input_target_mask, ref_mask, ic_masks):
         arcface_embeddings = []
@@ -996,7 +1015,7 @@ class MVHumanNetDataset(Dataset):
         infu_mask = ic_masks["infu"]
 
         # load raw GT frames from MVHN
-        frames = self._load_raw_frames(img_paths, img_mask_paths)
+        frames, image_masks = self._load_raw_frames(img_paths, img_mask_paths)
 
         # loads inconsistent frames from IC-light and InfU synthetic data
         ic_rgb, ic_paths = self._load_inconsistent_frames(
@@ -1015,8 +1034,9 @@ class MVHumanNetDataset(Dataset):
         )
 
         # transform GT and inconsistent frames + intrinsics to desired shape
-        frames, ic_rgb, Ks, sapiens_conditionings, face_bboxes_adjusted = self._crop_and_transform_frames_and_intrinsics(
-            frames_info, frames, ic_rgb,
+        # do these (special) crops for the synthetic data as well
+        frames, img_masks, ic_rgb, Ks, sapiens_conditionings, face_bboxes_adjusted = self._crop_and_transform_frames_and_intrinsics(
+            frames_info, frames, image_masks, ic_rgb,
             subject_id, cam_order, intrinsics,
             ref_mask, ic_masks, sapiens_conditionings
         )
@@ -1120,13 +1140,12 @@ class MVHumanNetDataset(Dataset):
                 "clean_latent": clean_latents, # unscaled clean latents
                 "mask": input_target_mask,
                 "ref_mask": ref_mask, # "one hot" mask for reference images 
-                # "ic_paths": ic_paths, # synthetic data paths
                 "ic_rgb": ic_rgb, # ! NOTE: normalized!
-                # "ic_bbox": rel_bbox, # for cropping ic latents
                 "plucker": pluckers,
                 "camera_mask": camera_mask,
                 "concat": concat,
-                "frames": frames,
+                "frames": frames,  # transformed frames (post-cropping, normalized)
+                "frames_masks": img_masks, # corresponding masks
                 "replace": replace, # contains pre-scaled clean latents!
                 "c2w": c2ws,
                 "K": Ks,
