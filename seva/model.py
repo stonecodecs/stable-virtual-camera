@@ -68,7 +68,7 @@ class SevaParams(object):
     use_ip_adapter: bool = False
     face_context_dim: int = 512
     use_id_head: bool = True
-
+    ip_lambda_weight: float = 1.0
     def __post_init__(self):
         assert len(self.channel_mult) == len(self.transformer_depth)
 
@@ -125,6 +125,7 @@ class Seva(nn.Module):
                             unflatten_names=params.unflatten_names,
                             use_ip_adapter=params.use_ip_adapter,
                             face_context_dim=params.face_context_dim,
+                            ip_lambda_weight=params.ip_lambda_weight,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*input_layers))
@@ -161,6 +162,7 @@ class Seva(nn.Module):
                 unflatten_names=params.unflatten_names,
                 use_ip_adapter=params.use_ip_adapter,
                 face_context_dim=params.face_context_dim,
+                ip_lambda_weight=params.ip_lambda_weight,
             ),
             ResBlock(
                 channels=ch,
