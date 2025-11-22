@@ -124,6 +124,7 @@ class IPAdapterTransformerBlock(nn.Module):
         context_dim: int,
         face_context_dim: int,
         dropout: float = 0.0,
+        lambda_weight: float = 1.0 # weight for face attention
     ):
         super().__init__()
         # To load pretrained weights
@@ -155,6 +156,7 @@ class IPAdapterTransformerBlock(nn.Module):
         )
         nn.init.zeros_(self.attn_face.to_out[0].weight)
         nn.init.zeros_(self.attn_face.to_out[0].bias)
+        self.lambda_weight = lambda_weight
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, face_context: torch.Tensor | None = None) -> torch.Tensor:
         x = self.attn1(self.norm1(x)) + x
@@ -166,7 +168,7 @@ class IPAdapterTransformerBlock(nn.Module):
             # Reshape context to combine frames and tokens for the attention mechanism
             if face_context.ndim == 4:
                 face_context = rearrange(face_context, "b f n d -> b (f n) d")
-            face_attn_output = self.attn_face(x_norm, context=face_context)
+            face_attn_output = self.attn_face(x_norm, context=face_context) * self.lambda_weight
             x = clip_attn_output + face_attn_output + x
         else:
             x = clip_attn_output + x

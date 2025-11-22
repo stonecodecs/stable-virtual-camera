@@ -1227,7 +1227,11 @@ class ArcFaceProjector(AbstractEmbModel):
         self.n_tokens = n_tokens
         self.is_trainable = is_trainable
         
-        self.proj = nn.Linear(input_dim, cross_attn_dim * n_tokens)
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, cross_attn_dim),
+            nn.GELU(),
+            nn.Linear(cross_attn_dim, cross_attn_dim * n_tokens),
+        )
         self.norm = nn.LayerNorm(cross_attn_dim)
 
         if not self.is_trainable:
