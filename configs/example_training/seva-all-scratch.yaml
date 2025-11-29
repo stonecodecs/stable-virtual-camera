@@ -54,7 +54,8 @@ model:
               ckpt_path: null
               use_ip_adapter: True
               face_context_dim: 512 # This is the *input* dim to the projector
-              use_id_head: False
+              use_id_head: false
+              ip_lambda_weight: 1.0
         self_attn_rank: 256
         cross_attn_rank: 512
         alpha: 64.0
@@ -122,8 +123,9 @@ model:
             discretization_config:
               target: sgm.modules.diffusionmodules.discretizer.SevaDDPMDiscretization
         face_weighting: 0.0
-        arcface_loss_weight: 0.2
+        arcface_loss_weight: 0.0
         arcface_gt_key: "arcface_embedding"
+        background_downweight: 0.01
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler
       params:
@@ -143,9 +145,9 @@ data:
     num_workers: 4
     num_images: 8
     step_size: 60
-    only_include: 100001-100490
-    val_include: 100491-100499
-    preload_path: /workspace/datasetvol/mvhuman_data/mv_captures/preloaded_filepaths1.json
+    only_include: 100001-104499
+    val_include: 104500-104800
+    preload_path: /workspace/datasetvol/mvhuman_data/preload_paths/shards
     iclight_dataset_path: /workspace/datasetvol/mvhuman_data/relit_images
     infu_dataset_path: /workspace/datasetvol/mvhuman_data/inconsistent_images
     # face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
