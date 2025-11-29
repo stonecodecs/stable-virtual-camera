@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import repeat
 
 from ...modules.autoencoding.lpips.loss.lpips import LPIPS
 from ...modules.encoders.modules import GeneralConditioner
@@ -56,10 +57,11 @@ class StandardDiffusionLoss(nn.Module):
         loss_type: str = "l2",
         offset_noise_level: float = 0.0,
         batch2model_keys: Optional[Union[str, List[str]]] = None,
-        use_face_perceptual: bool = False, # ! - computationally intractable, legacy
-        face_perceptual_weight: float = 0.3,
-        face_crop_size: int = 128,
         face_weighting: float = 0.0,
+        arcface_loss_weight: float = 0.0,
+        arcface_gt_key: str = "arcface_embedding",
+        background_downweight: float = 0.0,
+        **kwargs, # absorb unknown keys
     ):
         super().__init__()
 
@@ -70,15 +72,12 @@ class StandardDiffusionLoss(nn.Module):
 
         self.loss_type = loss_type
         self.offset_noise_level = offset_noise_level
-        self.use_face_perceptual = use_face_perceptual
-        self.face_perceptual_weight = face_perceptual_weight
-        self.face_crop_size = face_crop_size
-        self.face_weighting = face_weighting # how much to weigh the face over the rest
+        self.face_weighting = face_weighting  # how much to weigh the face over the rest
         # 0.0 -> no extra face weighting, spatially uniform loss weighting
-        # NOTE: this is different from using face_perceptual_weight
-        # as this creates a "weighting mask" in the latent space
-        # and applies to regular L2 loss.
-        
+        self.arcface_loss_weight = arcface_loss_weight
+        self.arcface_gt_key = arcface_gt_key
+        self.background_downweight = background_downweight
+
         # Store reference to first_stage_model for RGB decoding (set externally)
         self.first_stage_model = None
         self.scale_factor = None
@@ -86,13 +85,6 @@ class StandardDiffusionLoss(nn.Module):
         if loss_type == "lpips":
             self.lpips = LPIPS().eval()
         
-        # Initialize LPIPS for face perceptual loss if needed
-        if self.use_face_perceptual:
-            if not hasattr(self, 'lpips'):
-                self.lpips = LPIPS().eval()
-            for param in self.lpips.parameters():
-                param.requires_grad = False
-
         if not batch2model_keys:
             batch2model_keys = []
 
@@ -157,22 +149,86 @@ class StandardDiffusionLoss(nn.Module):
         else:
             w = append_dims(self.loss_weighting(sigmas), input.ndim)
         # Compute base loss
-        base_loss = self.get_loss(model_output, input, w, face_bbox=batch.get("face_bbox"), ref_mask=batch.get("ref_mask"), enable_face_weighting=self.face_weighting > 0.0)
+        loss = self.get_loss(
+            model_output,
+            input,
+            w,
+            face_bbox=batch.get("face_bbox"),
+            ref_mask=batch.get("ref_mask"),
+            enable_face_weighting=self.face_weighting > 0.0,
+            loss_mask=batch.get("frames_masks", None),
+        )
+
+        # Add auxiliary ArcFace identity loss if enabled
+        if self.training and self.arcface_loss_weight > 0.0:
+            arcface_loss = self.get_arcface_loss(network, batch)
+            loss = loss + self.arcface_loss_weight * arcface_loss
+            # clear for VRAM
+            if hasattr(network, "diffusion_model") and hasattr(
+                network.diffusion_model, "seva_model"
+            ):
+                network.diffusion_model.seva_model.predicted_arcface_embedding = None
+            else:
+                network.predicted_arcface_embedding = None
+
+        return loss
+
+    def get_arcface_loss(self, network: nn.Module, batch: Dict) -> torch.Tensor:
+        """
+        Computes the cosine similarity loss between predicted and ground-truth ArcFace embeddings.
+        """
+        # Get device and dtype from network parameters to ensure consistency
+        device = next(network.parameters()).device
+        dtype = next(network.parameters()).dtype
         
-        # Add face perceptual loss if enabled
-        if self.use_face_perceptual and "face_bbox" in batch:
-            # input is "clean_latent"
-            # in face loss, we work in RGB space, so we use batch["frames"]
-            # for LPIPS comparisons over the face
-            try: 
-                face_loss = self.get_face_crop_perceptual_loss(model_output, input, batch)
-            except Exception as e: # for any error, just continue with no face loss
-                print(f"Error in face perceptual loss: {e}")
-                face_loss = torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
-            total_loss = base_loss + self.face_perceptual_weight * face_loss
-            return total_loss
+        # The path to the Seva model might vary depending on wrappers
+        if hasattr(network, "diffusion_model") and hasattr(
+            network.diffusion_model, "seva_model"
+        ):
+            predicted_embed = (
+                network.diffusion_model.seva_model.predicted_arcface_embedding
+            )
+        else:
+            predicted_embed = network.predicted_arcface_embedding
+
+        if predicted_embed is None:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        gt_embed = batch.get(self.arcface_gt_key)
+        face_mask = torch.any(gt_embed, dim=2) # zero tensors don't count
+
+        if gt_embed is None or not face_mask.any():
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        if predicted_embed.shape[0] != gt_embed.shape[0]:
+            num_frames = predicted_embed.shape[0] // gt_embed.shape[0]
+            # Move to device and dtype before repeat to avoid intermediate device transfers
+            gt_embed_device = gt_embed.to(device=predicted_embed.device, dtype=predicted_embed.dtype)
+            gt_embed = repeat(gt_embed_device, "b ... -> (b f) ...", f=num_frames)
+            del gt_embed_device  # Clear intermediate tensor
+        else:
+            gt_embed = gt_embed.to(device=predicted_embed.device, dtype=predicted_embed.dtype)
+
+        # get average embedding for gt_embed, compare with predicted_embed
+        gt_embed_sum = gt_embed.sum(dim=1)
+        gt_embed_count = face_mask.sum(dim=1)
+        gt_embed_avg = gt_embed_sum / gt_embed_count.unsqueeze(-1)
+        gt_embed = gt_embed_avg.unsqueeze(1)
+        predicted_embed = predicted_embed * face_mask.unsqueeze(-1)
+
+        # if nans, replace with 0
+        gt_embed = torch.where(torch.isnan(gt_embed), torch.zeros_like(gt_embed), gt_embed)
+        predicted_embed = torch.where(torch.isnan(predicted_embed), torch.zeros_like(predicted_embed), predicted_embed)
         
-        return base_loss
+        # Normalize both embeddings before comparing
+        gt_embed_norm = F.normalize(gt_embed, p=2, dim=2)
+        predicted_embed_norm = F.normalize(predicted_embed, p=2, dim=2)
+
+        loss = 1.0 - F.cosine_similarity(predicted_embed_norm, gt_embed_norm, dim=1)
+        loss_mean = loss.mean(dim=1)
+
+        del predicted_embed_norm, gt_embed_norm, loss
+        return loss_mean
 
     def get_face_weighting_loss(self, face_bbox, spatial_loss, ref_mask):
         """
@@ -188,11 +244,12 @@ class StandardDiffusionLoss(nn.Module):
         """
         B, T, C, H, W = spatial_loss.shape
         
-        # Create spatial mask for face regions
-        spatial_mask = torch.zeros_like(spatial_loss, dtype=torch.bool)
+        # Compute face loss per batch element directly without creating large boolean mask
+        # This avoids creating a [B, T, C, H, W] boolean tensor which can be memory intensive
+        face_loss = torch.zeros(B, device=spatial_loss.device, dtype=spatial_loss.dtype)
         
-        # Loop through batch and time to mark face regions
         for b in range(B):
+            batch_face_losses = []
             for t in range(T):
                 # Skip reference frames (ground truth)
                 if ref_mask[b, t]:
@@ -213,29 +270,30 @@ class StandardDiffusionLoss(nn.Module):
                 if x1_lat >= x2_lat or y1_lat >= y2_lat:
                     continue
                 
-                # Mark face region in mask
-                spatial_mask[b, t, :, y1_lat:y2_lat, x1_lat:x2_lat] = True
-        
-        # If no valid faces, return zero for all batch elements
-        if not spatial_mask.any():
-            return torch.zeros(B, device=spatial_loss.device, dtype=spatial_loss.dtype)
-        
-        # Compute face loss per batch element separately
-        face_loss = torch.zeros(B, device=spatial_loss.device, dtype=spatial_loss.dtype)
-        for b in range(B):
-            batch_mask = spatial_mask[b]
-            if batch_mask.any():
-                face_loss[b] = torch.mean(spatial_loss[b][batch_mask])
+                # Extract face region and compute mean loss directly
+                face_region_loss = spatial_loss[b, t, :, y1_lat:y2_lat, x1_lat:x2_lat]
+                batch_face_losses.append(face_region_loss.mean())
+            
+            if batch_face_losses:
+                face_loss[b] = torch.stack(batch_face_losses).mean()
         
         return face_loss
 
 
-    def get_loss(self, model_output, target, w, face_bbox=None, ref_mask=None, enable_face_weighting=False):
+    def get_loss(self, model_output, target, w, face_bbox=None, ref_mask=None, enable_face_weighting=False, loss_mask=None):
         # add face weighting if face_weighting > 0.0
         additional_loss = torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
+        if loss_mask is not None:
+            assert loss_mask.shape[0] == model_output.shape[0], f"Loss mask batch size mismatch. Got {loss_mask.shape[0]} but expected {model_output.shape[0]}."
+            # use F.interpolate to resize the loss mask to the latent spatial dimensions
+            # HACK: hardcoded 8x downsampling
+            loss_mask = F.interpolate(
+                loss_mask.flatten(start_dim=0, end_dim=1), size=model_output.shape[-2:], mode='bilinear'
+            ).unflatten(dim=0, sizes=model_output.shape[:2])
+            loss_mask = torch.clamp(loss_mask, min=self.background_downweight, max=1.0).float() # downweight background by 100x (but not zero!)
  
         if self.loss_type == "l2":
-            spatial_loss = w * (model_output - target) ** 2 # [B, T, C, H, W]
+            spatial_loss = w * (model_output - target) ** 2 * loss_mask# [B, T, C, H, W]
             loss = torch.mean(
                 spatial_loss.reshape(target.shape[0], -1), 1
             )
@@ -244,7 +302,7 @@ class StandardDiffusionLoss(nn.Module):
                 loss = loss + additional_loss
             return loss
         elif self.loss_type == "l1":
-            spatial_loss = w * (model_output - target).abs()
+            spatial_loss = w * (model_output - target).abs() * loss_mask
             loss = torch.mean(
                 spatial_loss.reshape(target.shape[0], -1), 1
             )
@@ -252,7 +310,7 @@ class StandardDiffusionLoss(nn.Module):
                 additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss, ref_mask)
                 loss = loss + additional_loss
             return loss
-        elif self.loss_type == "lpips":
+        elif self.loss_type == "lpips": # only really usable in RGB space
             loss = self.lpips(model_output, target).reshape(-1)
             if enable_face_weighting and face_bbox is not None and ref_mask is not None:
                 additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, loss, ref_mask)
@@ -261,6 +319,8 @@ class StandardDiffusionLoss(nn.Module):
         else:
             raise NotImplementedError(f"Unknown loss type {self.loss_type}")
 
+
+    # ! DEPRECATED!
     def get_face_crop_perceptual_loss(
         self,
         model_output: torch.Tensor,  # Predicted latents [B, T, C, H, W]

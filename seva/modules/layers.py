@@ -72,11 +72,12 @@ class TimestepEmbedSequential(nn.Sequential):
         context: torch.Tensor,
         dense_emb: torch.Tensor,
         num_frames: int,
+        face_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         for layer in self:
             if isinstance(layer, MultiviewTransformer):
                 assert num_frames is not None
-                x = layer(x, context, num_frames)
+                x = layer(x, context, num_frames, face_context=face_context)
             elif isinstance(layer, ResBlock):
                 x = layer(x, emb, dense_emb)
             else:

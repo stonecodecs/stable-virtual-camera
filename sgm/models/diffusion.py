@@ -25,6 +25,118 @@ def compute_psnr(pred, target):
     return 10 * torch.log10(1.0 / mse)
 
 
+def initialize_new_channel_weights(state_dict, model, verbose=True):
+    """
+    Initialize weights for new input channels when loading a checkpoint with a fewer  channels.
+    
+    This function handles the case where the current model has more input channels than
+    the checkpoint. It initializes the new channel weights by averaging existing channel
+    weights, which is better than random initialization.
+    
+    Args:
+        state_dict: The state dict from the checkpoint
+        model: The current model (DiffusionEngine)
+        verbose: Whether to print information about the initialization
+    
+    Returns:
+        Modified state_dict with properly initialized new channel weights
+    """
+    # Possible key prefixes for the first conv layer depending on wrapper
+    possible_keys = [
+        "model.seva_model.input_blocks.0.0.weight",
+        "model.seva_model.input_blocks.0.0.bias",
+        "model.module.input_blocks.0.0.weight",
+        "model.module.input_blocks.0.0.bias",
+        "model.diffusion_model.input_blocks.0.0.weight",
+        "model.diffusion_model.input_blocks.0.0.bias",
+        "model.input_blocks.0.0.weight",
+        "model.input_blocks.0.0.bias",
+        "seva_model.input_blocks.0.0.weight",
+        "seva_model.input_blocks.0.0.bias",
+        "input_blocks.0.0.weight",
+        "input_blocks.0.0.bias",
+    ]
+    
+    # Find the weight key in the checkpoint
+    weight_key = None
+    bias_key = None
+    
+    # First try exact matches
+    for key in possible_keys:
+        if key.endswith(".weight") and key in state_dict:
+            weight_key = key
+            # Find corresponding bias key
+            bias_key = key.replace(".weight", ".bias")
+            if bias_key not in state_dict:
+                bias_key = None
+            break
+    
+    # If no exact match, try to find any key that ends with input_blocks.0.0.weight
+    if weight_key is None:
+        for key in state_dict.keys():
+            if key.endswith("input_blocks.0.0.weight") or key.endswith(".input_blocks.0.0.weight"):
+                weight_key = key
+                bias_key = key.replace(".weight", ".bias")
+                if bias_key not in state_dict:
+                    bias_key = None
+                break
+    
+    if weight_key is None:
+        if verbose:
+            print("Could not find first conv layer in checkpoint, skipping channel initialization")
+        return state_dict
+    
+    # Get checkpoint weights
+    ckpt_weight = state_dict[weight_key]  # [out_channels, old_in_channels, 3, 3]
+    ckpt_bias = state_dict[bias_key] if bias_key else None
+    
+    old_in_channels = ckpt_weight.shape[1]
+    
+    # Find the actual first conv layer in the current model
+    # Try to access through the wrapped model
+    first_conv = None
+    try:
+        actual_model = model.model.diffusion_model
+        first_conv = actual_model.seva_model.input_blocks[0][0]
+        if first_conv is None:
+            raise ValueError()
+    except:
+        print("Could not find first conv layer in current model, skipping channel initialization")
+        return state_dict
+
+    new_in_channels = first_conv.in_channels
+    out_channels = first_conv.out_channels
+    
+    if old_in_channels >= new_in_channels:
+        # No new channels to initialize
+        return state_dict
+    
+    if verbose:
+        print(f"Initializing {new_in_channels - old_in_channels} new input channels "
+              f"(from {old_in_channels} to {new_in_channels})")
+    
+    # Create new weight tensor
+    new_weight = torch.zeros(out_channels, new_in_channels, 3, 3, dtype=ckpt_weight.dtype)
+    
+    # Copy existing weights
+    new_weight[:, :old_in_channels, :, :] = ckpt_weight
+    
+    # Update state dict
+    state_dict[weight_key] = new_weight
+    
+    # Handle bias if present
+    if ckpt_bias is not None and bias_key:
+        new_bias = torch.zeros(out_channels, dtype=ckpt_bias.dtype)
+        new_bias[:ckpt_bias.shape[0]] = ckpt_bias
+        # New channels don't add bias (bias is per output channel, not input channel)
+        state_dict[bias_key] = new_bias
+    
+    if verbose:
+        print(f"Successfully initialized new channel weights for key: {weight_key}")
+    
+    return state_dict
+
+
 class DiffusionEngine(pl.LightningModule):
     def __init__(
         self,
@@ -47,11 +159,17 @@ class DiffusionEngine(pl.LightningModule):
         no_cond_log: bool = False,
         compile_model: bool = False,
         en_and_decode_n_samples_a_time: Optional[int] = None,
-        verbose_lora_deltas: bool = False
+        verbose_lora_deltas: bool = False,
+        strict_loading: bool = True,
+        use_sapiens_conditioning: list = [],
+        sapiens_segmentation_channels_to_use: list = [],
     ):
         super().__init__()
+        self.strict_loading = strict_loading
         self.log_keys = log_keys
         self.input_key = input_key
+        self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
+        self.use_sapiens_conditioning = use_sapiens_conditioning
         self.optimizer_config = default(
             optimizer_config, {"target": "torch.optim.AdamW"}
         )
@@ -77,12 +195,6 @@ class DiffusionEngine(pl.LightningModule):
             if loss_fn_config is not None
             else None
         )
-        
-        # Pass first_stage_model reference to loss for RGB decoding (if face perceptual loss is used)
-        if self.loss_fn is not None and hasattr(self.loss_fn, 'use_face_perceptual') and self.loss_fn.use_face_perceptual:
-            self.loss_fn.first_stage_model = self.first_stage_model
-            self.loss_fn.scale_factor = scale_factor
-            print(f"Face perceptual loss enabled: decoder and scale_factor ({scale_factor}) passed to loss_fn")
 
         self.use_ema = use_ema
         if self.use_ema:
@@ -99,6 +211,56 @@ class DiffusionEngine(pl.LightningModule):
         self.en_and_decode_n_samples_a_time = en_and_decode_n_samples_a_time
         self.verbose_lora_deltas = verbose_lora_deltas
 
+        # In DiffusionEngine.__init__, after self.conditioner initialization
+        # Add sapiens conditioning projection layers
+        self.sapiens_projections = torch.nn.ModuleDict()
+        if hasattr(self, 'use_sapiens_conditioning') and self.use_sapiens_conditioning is not None:
+            # You'll need to pass this as a config parameter
+            # For now, assuming you know the input/output channels
+            for cond_type in self.use_sapiens_conditioning:
+                if cond_type == "depth":
+                    in_channels = 1
+                    out_channels = 1
+                    kernel_size = 8
+                    stride = 8
+                elif cond_type == "seg_masks":
+                    # project all clasess to 4
+                    channels_to_use = len(self.sapiens_segmentation_channels_to_use)
+                    in_channels = channels_to_use if channels_to_use > 0 else 28 # (all of them)
+                    out_channels = 4
+                    kernel_size = 3
+                    stride = 2
+                elif cond_type == "latents":
+                    in_channels = 4
+                    out_channels = in_channels # same dimension as VAE
+                    kernel_size = 1
+                    stride = 1
+                else:
+                    continue
+                
+                if cond_type == "depth":
+                    self.sapiens_projections[cond_type] = torch.nn.Sequential(
+                        torch.nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride)
+                    )
+                elif cond_type == "seg_masks":
+                    self.sapiens_projections[cond_type] = torch.nn.Sequential(
+                        torch.nn.Conv2d(in_channels, 64, kernel_size=kernel_size, stride=stride, padding=1),
+                        torch.nn.GroupNorm(32, 64),
+                        torch.nn.SiLU(),
+                        torch.nn.Conv2d(64, 128, kernel_size=kernel_size, stride=stride, padding=1),
+                        torch.nn.GroupNorm(32, 128),
+                        torch.nn.SiLU(),
+                        torch.nn.Conv2d(128, 64, kernel_size=kernel_size, stride=stride, padding=1),
+                        torch.nn.GroupNorm(32, 64),
+                        torch.nn.SiLU(),
+                        torch.nn.Conv2d(64, out_channels, kernel_size=1, stride=1)
+                    )
+                elif cond_type == "latents":
+                    # TBD for latents, the below is a placeholder
+                    self.sapiens_projections[cond_type] = torch.nn.Sequential(
+                        torch.nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=1)
+                    )
+
     def init_from_ckpt(
         self,
         path: str,
@@ -109,6 +271,9 @@ class DiffusionEngine(pl.LightningModule):
             sd = load_safetensors(path)
         else:
             raise NotImplementedError
+
+        # Initialize new channel weights if model has more input channels than checkpoint
+        sd = initialize_new_channel_weights(sd, self, verbose=True)
 
         missing, unexpected = self.load_state_dict(sd, strict=False)
         print(
@@ -150,6 +315,7 @@ class DiffusionEngine(pl.LightningModule):
                 )
                 all_out.append(out)
         out = torch.cat(all_out, dim=0)
+        del all_out
         return out
 
     @torch.no_grad()
@@ -170,7 +336,7 @@ class DiffusionEngine(pl.LightningModule):
     def forward(self, x, batch):
         loss = self.loss_fn(self.model, self.denoiser, self.conditioner, x, batch)
         loss_mean = loss.mean()
-        loss_dict = {"loss": loss_mean}
+        loss_dict = {"loss": loss_mean.detach()}
         return loss_mean, loss_dict
 
     def _prepare_batch(self, batch: Dict):
@@ -199,6 +365,41 @@ class DiffusionEngine(pl.LightningModule):
             ic = torch.zeros_like(batch["clean_latent"], device=self.device)
             ic[batch["ref_mask"]] = batch["clean_latent"][batch["ref_mask"]]
 
+        # Project and concatenate sapiens conditionals if present
+        sapiens_projected = []
+        if "sapiens_conditioning" in batch and batch["sapiens_conditioning"] is not None:
+            for cond_type, cond_tensor in batch["sapiens_conditioning"].items():
+                if cond_type in self.sapiens_projections:
+                    # cond_tensor shape: (B, T, C, H, W)
+                    B, T, C, H, W = cond_tensor.shape
+                    # Reshape to (B*T, C, H, W) for conv2d
+                    cond_flat = cond_tensor.view(B * T, C, H, W).to(self.device)
+                    # Project
+                    projected = self.sapiens_projections[cond_type](cond_flat)
+                    # Scale to match the scale of other channels (IC latents use scale_factor)
+                    # This prevents the new channels from dominating the output
+                    if cond_type == "latents":
+                        # Latents should match the scale of IC latents
+                        projected = projected * self.scale_factor
+                        projected = projected.view(B, T, 4, 72, 72)
+                    else:
+                        # For depth/segmentation, scale down to match typical latent scale
+                        # GroupNorm outputs are roughly normalized, so scale to match latent range
+                        projected = projected.view(B, T, -1, H//8, W//8) # hardcoded
+                    sapiens_projected.append(projected)
+        
+        # Concatenate all projected sapiens conditionals
+        if sapiens_projected:
+            sapiens_concat = torch.cat(sapiens_projected, dim=2)  # (B, T, sum(C_out), H, W)
+            sapiens_concat[~batch["mask"]] = 0  # target frames should be zero
+        else:
+            sapiens_concat = None
+
+        concat_list = [batch["concat"], ic]
+        if sapiens_concat is not None:
+            concat_list.append(sapiens_concat)
+            del batch["sapiens_conditioning"] 
+
         # ensure for ref image, ic tensors should be replaced by clean latents 
         # add ic as conditioning in concat (along with clean + plucker + masks)
         batch.update({
@@ -211,8 +412,9 @@ class DiffusionEngine(pl.LightningModule):
                     w=batch["plucker"].shape[-1]
                 )
             ], dim=2),
-            "concat": torch.cat([batch["concat"], ic], dim=2)
+            "concat": torch.cat(concat_list, dim=2)
         }) # concat to be (B, T, 6(plucker) + 2(masks) + 4(ic))
+        del concat_list
         return x, batch
 
     def _encode_inconsistent_images(
@@ -228,12 +430,16 @@ class DiffusionEngine(pl.LightningModule):
         # load images from paths and convert to tensors
         B, num_images = ic_rgb.shape[0:2]
         latents_out = torch.empty(B, num_images, 4, 72, 72, device=self.device)
+        # Move entire batch to device once to avoid fragmentation from repeated transfers
+        ic_rgb_device = ic_rgb.to(self.device) if ic_rgb.device != self.device else ic_rgb
         with torch.no_grad():
             for i in range(B):
-                latents_out[i] = self.encode_first_stage(ic_rgb[i].to(self.device))
+                latents_out[i] = self.encode_first_stage(ic_rgb_device[i])
             # replace latents with clean latents for ref images
             latents_out[ref_mask] = clean_latent[ref_mask]
         self.en_and_decode_n_samples_a_time = old_chunk_size
+        # Clear reference to avoid keeping large tensor in memory
+        del ic_rgb_device
         return latents_out # latents_out is in GPU, rgb_images in CPU
 
     def shared_step(self, batch: Dict) -> Any: 
@@ -436,6 +642,12 @@ class DiffusionEngine(pl.LightningModule):
         for embedder in self.conditioner.embedders:
             if embedder.is_trainable:
                 params = params + list(embedder.parameters())
+
+        # for sapiens projection layers
+        if hasattr(self, 'sapiens_projections') and self.sapiens_projections is not None:
+            for projection in self.sapiens_projections.values():
+                params = params + list(projection.parameters()) if isinstance(projection, torch.nn.Module) else []
+
         opt = self.instantiate_optimizer_from_config(params, lr, self.optimizer_config) # AdamW
         if self.scheduler_config is not None:
             scheduler = instantiate_from_config(self.scheduler_config) # LambdaLinearScheduler

@@ -19,6 +19,34 @@ from typing import Union
 
 from safetensors.torch import load_file
 
+class ArcFaceHead(nn.Module):
+    """
+    Projects features from the middle block of the U-Net to the ArcFace embedding space.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int = 512, num_images: int = 8):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.num_images = num_images
+
+        self.pooling = nn.AdaptiveAvgPool2d((1, 1))
+        self.norm = nn.LayerNorm(in_channels)
+        self.proj = nn.Sequential(
+            nn.Linear(in_channels, in_channels * 2),
+            nn.GELU(),
+            nn.Linear(in_channels * 2, out_channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pooling(x)
+        x = x.flatten(start_dim=1, end_dim=3)
+        x = self.norm(x)
+        x = self.proj(x)
+        x = x.reshape(-1, self.num_images, self.out_channels) # ! 8 hardcoded for now
+        return x
+
+
 @dataclass
 class SevaParams(object):
     in_channels: int = 11
@@ -37,7 +65,10 @@ class SevaParams(object):
         default_factory=lambda: ["middle_ds8", "output_ds4", "output_ds2"]
     )
     ckpt_path: str | None = None
-
+    use_ip_adapter: bool = False
+    face_context_dim: int = 512
+    use_id_head: bool = True
+    ip_lambda_weight: float = 1.0
     def __post_init__(self):
         assert len(self.channel_mult) == len(self.transformer_depth)
 
@@ -92,6 +123,9 @@ class Seva(nn.Module):
                             depth=params.transformer_depth[level],
                             context_dim=params.context_dim,
                             unflatten_names=params.unflatten_names,
+                            use_ip_adapter=params.use_ip_adapter,
+                            face_context_dim=params.face_context_dim,
+                            ip_lambda_weight=params.ip_lambda_weight,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*input_layers))
@@ -126,6 +160,9 @@ class Seva(nn.Module):
                 depth=params.transformer_depth[-1],
                 context_dim=params.context_dim,
                 unflatten_names=params.unflatten_names,
+                use_ip_adapter=params.use_ip_adapter,
+                face_context_dim=params.face_context_dim,
+                ip_lambda_weight=params.ip_lambda_weight,
             ),
             ResBlock(
                 channels=ch,
@@ -136,6 +173,10 @@ class Seva(nn.Module):
             ),
         )
         self._feature_size += ch
+        if params.use_id_head:
+            self.arcface_head = ArcFaceHead(in_channels=ch, num_images=params.num_frames)
+        else:
+            self.arcface_head = None
 
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(params.channel_mult))[::-1]:
@@ -164,6 +205,8 @@ class Seva(nn.Module):
                             depth=params.transformer_depth[level],
                             context_dim=params.context_dim,
                             unflatten_names=params.unflatten_names,
+                            use_ip_adapter=params.use_ip_adapter,
+                            face_context_dim=params.face_context_dim,
                         )
                     )
                 if level and i == params.num_res_blocks:
@@ -178,6 +221,7 @@ class Seva(nn.Module):
             nn.SiLU(),
             nn.Conv2d(self.model_channels, params.out_channels, 3, padding=1),
         )
+        self.predicted_arcface_embedding = None
 
         if load_pretrained:
             from seva.utils import print_load_warning
@@ -217,6 +261,7 @@ class Seva(nn.Module):
         y: torch.Tensor,
         dense_y: torch.Tensor,
         num_frames: int | None = None,
+        face_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_frames = num_frames or self.params.num_frames
         t_emb = timestep_embedding(t, self.model_channels)
@@ -231,6 +276,7 @@ class Seva(nn.Module):
                 context=y,
                 dense_emb=dense_y,
                 num_frames=num_frames,
+                face_context=face_context,
             )
             hs.append(h)
         h = self.middle_block(
@@ -239,7 +285,14 @@ class Seva(nn.Module):
             context=y,
             dense_emb=dense_y,
             num_frames=num_frames,
+            face_context=face_context,
         )
+
+        if self.training and face_context is not None and self.arcface_head is not None:
+            self.predicted_arcface_embedding = self.arcface_head(h)
+        else:
+            self.predicted_arcface_embedding = None
+
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
             h = module(
@@ -248,6 +301,7 @@ class Seva(nn.Module):
                 context=y,
                 dense_emb=dense_y,
                 num_frames=num_frames,
+                face_context=face_context,
             )
         h = h.type(x.dtype)
         return self.out(h) # [B*num_images, C=4, H=72, W=72]
@@ -288,7 +342,7 @@ class SGMWrapper(nn.Module):
     def forward(
         self, x: torch.Tensor, t: torch.Tensor, c: dict, **kwargs
     ) -> torch.Tensor:
-        # c: crossattn, concat, dense_vector
+        # c: crossattn, concat, dense_vector, face_cond
         # kwargs 'num_frames'
         x = torch.cat((x, c.get("concat", torch.Tensor([]).type_as(x))), dim=1)
         # 16,11,72,72 (concat is 7, latent x is 4)
@@ -297,31 +351,6 @@ class SGMWrapper(nn.Module):
             t=t,
             y=c["crossattn"],
             dense_y=c["dense_vector"],
+            face_context=c.get("face_cond"),
             **kwargs,
         )
-
-# class SevaLightningModule(pl.LightningModule):
-#     def __init__(self, seva_model: Seva):
-#         super().__init__()
-#         self.model = seva_model
-        
-#     def forward(self, x, t, y, dense_y, num_frames=None):
-#         return self.model(x, t, y, dense_y, num_frames)
-
-    # this is never used or reached
-    # @rank_zero_only
-    # def log_images(self, input_tensor, output_tensor, target_tensor):
-    #     print("within SevaLightningModule::log_images!")
-    #     # Assume [B,C,H,W] and normalize to [0,1] for wandb.Image
-    #     images = []
-
-    #     for i in range(min(4, input_tensor.size(0))):  # limit to first 4 images
-    #         img_grid = torchvision.utils.make_grid([
-    #             input_tensor[i].detach().cpu(),
-    #             output_tensor[i].detach().cpu(),
-    #             target_tensor[i].detach().cpu(),
-    #         ], nrow=3, normalize=True, scale_each=True)
-
-    #         images.append(wandb.Image(img_grid, caption=f"Sample {i}"))
-
-    #     self.logger.experiment.log({"val/reconstructions": images, "global_step": self.global_step})

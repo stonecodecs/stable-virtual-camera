@@ -25,6 +25,7 @@ from pytorch_lightning.utilities import rank_zero_only
 from diffusers import AutoencoderKL
 from seva.sampling import MultiviewCFG
 from sgm.util import exists, instantiate_from_config, isheatmap
+from sgm.models.diffusion import initialize_new_channel_weights
 import matplotlib.cm as cm
 from matplotlib.image import imread
 import torch.nn.functional as F
@@ -197,6 +198,11 @@ def get_parser(**parser_kwargs):
         const=True,
         default=False,  # TODO: later default to True
         help="log to wandb",
+    )
+    parser.add_argument(
+        "--no-strict-loading",
+        action="store_true",
+        help="Set to True when loading a checkpoint with a modified architecture (e.g., adding IP-Adapter)."
     )
     parser.add_argument(
         "--override_ngpu",
@@ -660,8 +666,8 @@ class ImageLogger(Callback):
         # pl_module: Union[None, pl.LightningModule] = None,
     ):
         root = os.path.join(save_dir, "images", split)
-        ref_mask   = masks[0]
-        input_mask = masks[1]
+        ref_mask   = masks[0].reshape(-1)
+        input_mask = masks[1].reshape(-1)
         components_for_diffmap = []
         for k in images:
             if isheatmap(images[k]):
@@ -689,12 +695,12 @@ class ImageLogger(Callback):
                 for i, img in enumerate(images[k]):
                     # Determine border color based on image key or index
                     
-                    if input_mask[i]: # inputs
+                    if input_mask[i].item(): # inputs
                         border_color = (247.0, 121.0, 132.0)  # red
                     else: # targets
                         border_color = (101.0, 174.0, 219.0)  # blue
                     # if ref image, then should be green
-                    if ref_mask[i]:
+                    if ref_mask[i].item():
                         border_color = (0.0, 255.0, 0.0) # green
 
                     img = self.denormalize_image(self.tensor_to_image(img)) # (-1, 1) ->(0, 1)
@@ -823,7 +829,7 @@ class ImageLogger(Callback):
             should_log
             # self.check_frequency(check_idx)
             and hasattr(pl_module, "log_images")  # batch_idx % self.batch_freq == 0
-            and callable(pl_module.log_images)
+            and callable(pl_module.log_images) 
             and self.max_images > 0
         ):
             
@@ -848,7 +854,89 @@ class ImageLogger(Callback):
 
             # NEW -- CPU based logging, based on DiffusionEngine.log_images
             # ! replaced with old GPU logging
-            with torch.no_grad():
+            # Note: Removed autocast("cuda") as it can cause "invalid configuration argument" errors
+            # with certain operations (e.g., CNN projections). Decoding happens on CPU anyway.
+            with torch.no_grad(), torch.amp.autocast("cuda"):
+                x = pl_module.get_input(batch)
+                N = self.log_images_kwargs.get("N", x.shape[0]) # these only get the first N batches
+                
+                if len(x.shape) == 1: # if latents are NOT computed yet, encode
+                    x = batch["frames"][:N].to(pl_module.device)
+                    
+                    batch_latents = []
+                    for b in x:
+                        batch_latents.append(pl_module.encode_first_stage(b)) # scales automatically
+                    x = torch.stack(batch_latents, dim=0)
+                    batch["clean_latent"] = x
+                    del batch_latents
+                else: #latents already precomputed (same as "IdentityEncoder")
+                    batch["clean_latent"] = x * pl_module.scale_factor # need to scale!
+
+                # encode ic latents from the paths (scales)
+                if torch.any(batch["use_inconsistent"]).item():
+                    ic = pl_module._encode_inconsistent_images(batch["ic_rgb"][:N], batch["ref_mask"][:N], batch["clean_latent"][:N])
+                    # for target (not input/ref) frames, zero condition latents
+                    ic[~batch["mask"][:N]] = 0
+                    rgb_ic = batch["ic_rgb"][:N]
+                else:
+                    # no conditioning (to be replaced by clean_latents for inputs)
+                    ic = torch.zeros_like(batch["clean_latent"], device=pl_module.device)
+                    ic[batch["ref_mask"][:N]] = batch["clean_latent"][batch["ref_mask"][:N]]
+                    rgb_ic = batch["frames"]
+
+                z = x
+
+                # Project and concatenate sapiens conditionals if present
+                # Match the exact preprocessing from diffusion.py _prepare_batch
+                sapiens_projected = []
+                if "sapiens_conditioning" in batch and batch["sapiens_conditioning"] is not None:
+                    for cond_type, cond_tensor in batch["sapiens_conditioning"].items():
+                        if cond_type in pl_module.sapiens_projections:
+                            cond_tensor = cond_tensor[:N]
+                            # cond_tensor shape: (B, T, C, H, W)
+                            B, T, C, H, W = cond_tensor.shape
+                            # Reshape to (B*T, C, H, W) for conv2d
+                            cond_flat = cond_tensor.view(B * T, C, H, W).to(pl_module.device)
+                            # Project
+                            projected = pl_module.sapiens_projections[cond_type](cond_flat)
+                            # Scale to match the scale of other channels (IC latents use scale_factor)
+                            # This prevents the new channels from dominating the output
+                            if cond_type == "latents":
+                                # Latents should match the scale of IC latents
+                                projected = projected * pl_module.scale_factor
+                                projected = projected.view(B, T, 4, 72, 72)
+                            else:
+                                # For depth/segmentation, scale down to match typical latent scale
+                                # GroupNorm outputs are roughly normalized, so scale to match latent range
+                                projected = projected.view(B, T, -1, H//8, W//8) # hardcoded
+                            sapiens_projected.append(projected)
+                
+                # Concatenate all projected sapiens conditionals
+                if sapiens_projected:
+                    sapiens_concat = torch.cat(sapiens_projected, dim=2)  # (B, T, sum(C_out), H, W)
+                    sapiens_concat[~batch["mask"][:N]] = 0  # target frames should be zero
+                else:
+                    sapiens_concat = None
+
+                concat_list = [batch["concat"][:N], ic]
+                if sapiens_concat is not None:
+                    concat_list.append(sapiens_concat)
+                    del batch["sapiens_conditioning"] 
+
+                batch.update({
+                    "replace": torch.cat([
+                        batch["clean_latent"][:N],
+                        repeat(
+                            batch["ref_mask"][:N],
+                            "b n -> b n 1 h w",
+                            h=batch["plucker"].shape[-2],
+                            w=batch["plucker"].shape[-1]
+                        )
+                    ], dim=2),
+                    "concat": torch.cat(concat_list, dim=2)
+                })
+                del concat_list
+
                 conditioner_input_keys = [e.input_key for e in pl_module.conditioner.embedders]
                 if self.log_images_kwargs.get("ucg_keys"):
                     ucg_keys = self.log_images_kwargs.get("ucg_keys")
@@ -860,41 +948,6 @@ class ImageLogger(Callback):
                     ucg_keys = conditioner_input_keys
 
                 log = dict()
-                x = pl_module.get_input(batch) # clean_latent
-                if len(x.shape) == 1: # if latents are NOT computed yet, encode
-                    x = batch["frames"].to(pl_module.device)
-                    batch_latents = []
-                    for b in x:
-                        batch_latents.append(pl_module.encode_first_stage(b)) # scales automatically
-                    x = torch.stack(batch_latents, dim=0)
-                else: 
-                    x = x * pl_module.scale_factor
-                batch["clean_latent"] = x
-
-                if torch.any(batch["use_inconsistent"]).item():
-                    ic = pl_module._encode_inconsistent_images(batch["ic_rgb"], batch["ref_mask"], batch["clean_latent"])
-                    # for target (not input/ref) frames, zero condition latents
-                    ic[~batch["mask"]] = 0
-                    rgb_ic = batch["ic_rgb"]
-                else:
-                    # no conditioning (to be replaced by clean_latents for inputs)
-                    ic = torch.zeros_like(batch["clean_latent"], device=pl_module.device)
-                    ic[batch["ref_mask"]] = batch["clean_latent"][batch["ref_mask"]]
-                    rgb_ic = batch["frames"] # same thing as GTs in phase 1
-
-                # update the batch using this
-                batch.update({
-                    "replace": torch.cat([
-                        batch["clean_latent"],
-                        repeat(
-                            batch["ref_mask"],
-                            "b n -> b n 1 h w",
-                            h=batch["concat"].shape[-2],
-                            w=batch["concat"].shape[-1]
-                        )
-                    ], dim=2),
-                    "concat": torch.cat([batch["concat"], ic], dim=2)
-                }) # concat to be (B, T, 6(plucker) + 2(masks) + 4(ic))
 
                 c, uc = pl_module.conditioner.get_unconditional_conditioning(
                     batch,
@@ -905,20 +958,32 @@ class ImageLogger(Callback):
 
                 uc["plucker"] = c["plucker"] # camera embeds are the same (test time)
 
+                if "face_cond" in uc and uc["face_cond"].ndim == 3:
+                    c["face_cond"] = c["face_cond"].repeat(x.shape[0], 1, 1, 1)
+                    uc["face_cond"] = uc["face_cond"].repeat(x.shape[0], 1, 1, 1)
+
                 sampling_kwargs = {}
                 if isinstance(pl_module.sampler.guider, MultiviewCFG):
                     sampling_kwargs["c2w"] = batch.get("c2w", None)
                     sampling_kwargs["K"] = batch.get("K", None)
                     sampling_kwargs["input_frame_mask"] = batch.get("mask", None)
 
-                # keep GPU until we have the generated latents
-                N = min(x.shape[0], self.max_images) # these only get the first N batches
-                x = x.to(pl_module.device)[:N]
-                z = x
-
+                if sampling_kwargs["c2w"] is not None:
+                    sampling_kwargs["c2w"] = sampling_kwargs["c2w"][:N]  # Slice batch dimension
+                if sampling_kwargs["K"] is not None:
+                    sampling_kwargs["K"] = sampling_kwargs["K"][:N]  # Slice batch dimension
+                if sampling_kwargs["input_frame_mask"] is not None:
+                    sampling_kwargs["input_frame_mask"] = sampling_kwargs["input_frame_mask"][:N]  # Slice batch dimension
+                
+                # Slice all conditionings to match N (batch dimension is first)
+                # This ensures cond["replace"] matches the batch size of input after CFG expansion
                 for k in c:
                     if isinstance(c[k], torch.Tensor):
-                        c[k], uc[k] = map(lambda y: y[k][:N].to(pl_module.device), (c, uc))
+                        # Slice the batch dimension (first dimension) for all tensors
+                        c[k] = c[k][:N].to(pl_module.device)
+                        if k in uc and isinstance(uc[k], torch.Tensor):
+                            uc[k] = uc[k][:N].to(pl_module.device)
+
                 # sample latents for targets
                 if sample:
                     # with pl_module.ema_scope("Plotting"): 
@@ -934,9 +999,9 @@ class ImageLogger(Callback):
 
                 pre_images = {} # legacy name
                 pre_images["inputs"] = gt_images
-                pre_images["reconstructions"] = z
+                pre_images["reconstructions"] = z.detach().cpu()
                 if sample:
-                    pre_images["samples"] = samples
+                    pre_images["samples"] = samples.detach().cpu()
 
                 face_bbox = batch.get("face_bbox")
                 if face_bbox is not None:
@@ -949,14 +1014,14 @@ class ImageLogger(Callback):
                         if pre_images[k].dim() == 5:
                             batch_size, num_images = pre_images[k].shape[:2]
                             total_images = batch_size * num_images
-                            N = min(total_images, self.max_images)
+                            N_frames = min(total_images, self.max_images)
                             # Flatten to [batch_size*num_images, C, H, W] for easier slicing
                             pre_images[k] = pre_images[k].view(total_images, *pre_images[k].shape[2:])
-                            pre_images[k] = pre_images[k][:N]
+                            pre_images[k] = pre_images[k][:N_frames]
                         else:
-                            N = min(pre_images[k].shape[0], self.max_images)
+                            N_frames = min(pre_images[k].shape[0], self.max_images)
                             if not isheatmap(pre_images[k]):
-                                pre_images[k] = pre_images[k][:N]
+                                pre_images[k] = pre_images[k][:N_frames]
                         
                         # if k == "samples" or k == "reconstructions": # uncomment if using GPU-based logging
                         #     # decode latents
@@ -969,8 +1034,8 @@ class ImageLogger(Callback):
 
                 masks = []
                 # masks = batch["mask"] # (B, max_images) binary boolean tensor
-                masks.append(batch["ref_mask"].reshape(-1)[:N].detach().cpu()) # (B, max_images) binary boolean tensor
-                masks.append(batch["mask"].reshape(-1)[:N].detach().cpu()) # (B, max_images) binary boolean tensor
+                masks.append(batch["ref_mask"][:N].detach().cpu()) # (B, max_images) binary boolean tensor
+                masks.append(batch["mask"][:N].detach().cpu()) # (B, max_images) binary boolean tensor
 
                 if is_train: # if was training previously, set it back
                     # this shouldn't interfere, since the VAE is frozen anyways
@@ -997,6 +1062,17 @@ class ImageLogger(Callback):
                     pl_module.global_step, pl_module.current_epoch, batch_idx, pl_module.logger, pl_module.scale_factor,
                     face_bbox=face_bbox
                 )
+
+                # Explicitly delete all GPU tensors to free memory
+                del x, z, ic
+                if "sapiens_projected" in locals():
+                    del sapiens_projected
+                if "sapiens_concat" in locals():
+                    del sapiens_concat
+                if "c" in locals():
+                    del c
+                if "uc" in locals():
+                    del uc      
             
 
             # for k in images: # images is dict{inputs, reconstructions, samples} (as in diffusion.py)
@@ -1280,6 +1356,14 @@ if __name__ == "__main__":
         configs = [OmegaConf.load(cfg) for cfg in opt.base]
         cli = OmegaConf.from_dotlist(unknown)
         config = OmegaConf.merge(*configs, cli)
+
+        # Add strict_loading to model config if flag is present
+        if opt.no_strict_loading:
+            print("Setting model.strict_loading to False for non-strict checkpoint loading.")
+            if "params" not in config.model:
+                config.model.params = OmegaConf.create()
+            config.model.params.strict_loading = False
+
         lightning_config = config.pop("lightning", OmegaConf.create())
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
@@ -1316,6 +1400,62 @@ if __name__ == "__main__":
 
         # model
         model = instantiate_from_config(config.model) # DiffusionEngine
+
+        if ckpt_resume_path:
+            try:
+                print(f"Attempting weights-only load from checkpoint '{ckpt_resume_path}' "
+                    "(optimizer/scheduler WILL NOT be restored).")
+                ckpt = torch.load(ckpt_resume_path, map_location="cpu", weights_only=False)
+
+                # Lightning checkpoints usually store the model under "state_dict"
+                if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                    sd = ckpt["state_dict"]
+                else:
+                    # If it's a bare state_dict or different format, try to use it directly
+                    sd = ckpt
+
+                # Initialize new channel weights if model has more input channels than checkpoint
+                sd = initialize_new_channel_weights(sd, model, verbose=True)
+
+                # Determine strict flag from model config if present, otherwise True
+                strict_loading = True
+                try:
+                    # config.model may be an OmegaConf object
+                    if "params" in config.model and "strict_loading" in config.model.params:
+                        strict_loading = bool(config.model.params.strict_loading)
+                except Exception:
+                    # ignore and use default True
+                    strict_loading = True
+
+                # Load weights into model (ignores missing/unexpected keys according to strict_loading)
+                model.load_state_dict(sd, strict=strict_loading)
+                print("Weights-only load succeeded. Clearing ckpt_resume_path to avoid optimizer restore.")
+                # Prevent Lightning from restoring optimizer/scheduler state
+                ckpt_resume_path = None
+
+                # Clear any references in opt/trainer_config as a precaution
+                try:
+                    if hasattr(opt, "resume_from_checkpoint"):
+                        opt.resume_from_checkpoint = None
+                except Exception:
+                    pass
+                try:
+                    if "resume_from_checkpoint" in trainer_config:
+                        del trainer_config["resume_from_checkpoint"]
+                except Exception:
+                    pass
+
+                # If trainer_opt was already created as a Namespace, clear that field too
+                try:
+                    if "trainer_opt" in locals() and hasattr(trainer_opt, "resume_from_checkpoint"):
+                        trainer_opt.resume_from_checkpoint = None
+                except Exception:
+                    pass
+
+            except Exception as e:
+                # If weights-only load fails, keep ckpt_resume_path so Lightning can try full restore
+                print(f"Warning: weights-only load from checkpoint failed: {e!r}")
+                print("Proceeding with ckpt_resume_path unchanged so Lightning may attempt full resume.")
 
         # trainer and callbacks
         trainer_kwargs = dict()
@@ -1398,7 +1538,7 @@ if __name__ == "__main__":
             strategy_cfg = OmegaConf.create()
             default_strategy_config["params"] = {
                 "find_unused_parameters": False,
-                "timeout": 7200,  # 2 hours timeout in seconds (will be converted to timedelta)
+                "timeout": 3600,  # 1 hours timeout in seconds (will be converted to timedelta)
                 # "static_graph": True,
                 # "ddp_comm_hook": default.fp16_compress_hook  # TODO: experiment with this, also for DDPSharded
             }
@@ -1495,7 +1635,13 @@ if __name__ == "__main__":
         trainer_kwargs = {
             key: val for key, val in trainer_kwargs.items() if key not in trainer_opt
         } # logger, strategy, callbacks, etc.
+
         trainer = Trainer(**trainer_opt, **trainer_kwargs)
+        
+        # Manually set strict loading for the trainer if the flag is provided
+        if opt.no_strict_loading:
+            trainer.strict_loading = False
+            print("Trainer strict loading has been set to False.")
 
         trainer.logdir = logdir  ###
 
@@ -1562,7 +1708,7 @@ if __name__ == "__main__":
         # run
         if opt.train:
             try:
-                print(model)
+                ckpt_resume_path = None
                 trainer.fit(model, data, ckpt_path=ckpt_resume_path)
             except Exception as e:
                 print(f"Error: {e}")

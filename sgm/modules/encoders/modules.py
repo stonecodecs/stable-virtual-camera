@@ -31,6 +31,7 @@ class AbstractEmbModel(nn.Module):
         self._is_trainable = None
         self._ucg_rate = None
         self._input_key = None
+        self._output_key = None
 
     @property
     def is_trainable(self) -> bool:
@@ -44,6 +45,10 @@ class AbstractEmbModel(nn.Module):
     def input_key(self) -> str:
         return self._input_key
 
+    @property
+    def output_key(self) -> Optional[str]:
+        return self._output_key
+
     @is_trainable.setter
     def is_trainable(self, value: bool):
         self._is_trainable = value
@@ -55,6 +60,10 @@ class AbstractEmbModel(nn.Module):
     @input_key.setter
     def input_key(self, value: str):
         self._input_key = value
+
+    @output_key.setter
+    def output_key(self, value: str):
+        self._output_key = value
 
     @is_trainable.deleter
     def is_trainable(self):
@@ -68,10 +77,14 @@ class AbstractEmbModel(nn.Module):
     def input_key(self):
         del self._input_key
 
+    @output_key.deleter
+    def output_key(self):
+        del self._output_key
+
 
 class GeneralConditioner(nn.Module):
     OUTPUT_DIM2KEYS = {2: "vector", 3: "crossattn", 4: "concat", 5: "concat"}
-    KEY2CATDIM = {"vector": 1, "crossattn": 2, "concat": 1, "cond_view": 1, "cond_motion": 1}
+    KEY2CATDIM = {"vector": 1, "crossattn": 2, "concat": 1, "cond_view": 1, "cond_motion": 1, "face_cond": 2}
 
     def __init__(self, emb_models: Union[List, ListConfig]):
         super().__init__()
@@ -101,6 +114,9 @@ class GeneralConditioner(nn.Module):
                 raise KeyError(
                     f"need either 'input_key' or 'input_keys' for embedder {embedder.__class__.__name__}"
                 )
+
+            if "output_key" in embconfig:
+                embedder.output_key = embconfig["output_key"]
 
             embedder.legacy_ucg_val = embconfig.get("legacy_ucg_value", None)
             if embedder.legacy_ucg_val is not None:
@@ -139,7 +155,9 @@ class GeneralConditioner(nn.Module):
             if not isinstance(emb_out, (list, tuple)):
                 emb_out = [emb_out]
             for emb in emb_out:
-                if embedder.input_key in ["cond_view", "cond_motion", "plucker", "mask", "replace"]:
+                if hasattr(embedder, "output_key") and embedder.output_key is not None:
+                    out_key = embedder.output_key
+                elif embedder.input_key in ["cond_view", "cond_motion", "plucker", "mask", "replace"]:
                     out_key = embedder.input_key
                 else:
                     out_key = self.OUTPUT_DIM2KEYS[emb.dim()]
@@ -220,11 +238,13 @@ class IdentityEncoder(AbstractEmbModel):
 class SevaAutoencoder(AbstractEmbModel):
     def __init__(self, chunk_size: int | None = None, scale_factor: float = 0.18215):
         super().__init__()
+        # "stabilityai/stable-diffusion-2-1-base",
         self.module = AutoencoderKL.from_pretrained(
-            "stabilityai/stable-diffusion-2-1-base",
+            "/root/.cache/huggingface/hub/models--stabilityai--stable-diffusion-2-1-base/snapshots/5ede9e4bf3e3fd1cb0ef2f7a3fff13ee514fdf06/", 
             subfolder="vae",
             force_download=False,
             low_cpu_mem_usage=False,
+            local_files_only=True
         )
         self.module.eval().requires_grad_(False)  # type: ignore
         self.chunk_size = chunk_size
@@ -1186,3 +1206,37 @@ class SevaFrozenOpenCLIPImageEmbedder(AbstractEmbModel):
 
     def encode(self, text):
         return self(text)
+
+
+class ArcFaceProjector(AbstractEmbModel):
+    """
+    Projects the 512-dim ArcFace embeddings to a new dimension (e.g., 1024)
+    and applies Layer Normalization. This is intended to be used as an embedder
+    within the GeneralConditioner. (Follows design from IP-Adapter)
+    """
+    def __init__(
+        self,
+        input_dim: int = 512,   # ArcFace
+        cross_attn_dim: int = 1024, # CLIP cross attention dim
+        n_tokens: int = 4,      # sequence length
+        is_trainable: bool = True,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.cross_attn_dim = cross_attn_dim
+        self.n_tokens = n_tokens
+        self.is_trainable = is_trainable
+        
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, cross_attn_dim),
+            nn.GELU(),
+            nn.Linear(cross_attn_dim, cross_attn_dim * n_tokens),
+        )
+        self.norm = nn.LayerNorm(cross_attn_dim)
+
+        if not self.is_trainable:
+            self.proj.eval().requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        return self.norm(self.proj(x).reshape(B, -1, self.n_tokens, self.cross_attn_dim))
