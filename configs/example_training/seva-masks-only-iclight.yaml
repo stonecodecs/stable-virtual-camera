@@ -1,5 +1,5 @@
 model:
-  base_learning_rate: 1.0e-04
+  base_learning_rate: 2.0e-05
   target: sgm.models.diffusion.DiffusionEngine
   params:
     scale_factor: 0.18215
@@ -55,6 +55,7 @@ model:
               use_ip_adapter: False  # Disabled: using only sapiens conditionings
               face_context_dim: 512  # Not used when use_ip_adapter=False
               use_id_head: False
+              ip_lambda_weight: 1.0
         self_attn_rank: 256
         cross_attn_rank: 512
         alpha: 64.0
@@ -116,6 +117,7 @@ model:
         face_weighting: 0.0
         arcface_loss_weight: 0.0  # Disabled: not using ArcFace
         arcface_gt_key: "arcface_embedding"
+        background_downweight: 0.01
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler
       params:
@@ -131,16 +133,16 @@ data:
   target: seva.data.mvh_dataloader.MVHumanNetLoader
   params:
     root_dir: /workspace/datasetvol/mvhuman_data/mv_captures
-    batch_size: 2
+    batch_size: 6
     num_workers: 4
     num_images: 8
     step_size: 60
-    only_include: 100001-100490
-    val_include: 100491-100499
-    preload_path: /workspace/datasetvol/mvhuman_data/mv_captures/preloaded_filepaths1.json
+    only_include: 100001-104499
+    val_include: 104500-104800
+    preload_path: /workspace/datasetvol/mvhuman_data/preload_paths/shards
     iclight_dataset_path: /workspace/datasetvol/mvhuman_data/relit_images
     infu_dataset_path: null
-    # face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
+    face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
     arcface_embeddings_dir: null  # Disabled: not using ArcFace embeddings
     ### match this with DiffusionEngine!
     use_sapiens_conditioning: [ "depth", "seg_masks" ]

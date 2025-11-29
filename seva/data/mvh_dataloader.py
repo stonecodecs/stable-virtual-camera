@@ -44,6 +44,7 @@ from seva.data.cropper import RandomBBoxCropper
 from seva.modules.autoencoder import AutoEncoder
 import torchvision
 import h5py
+from datasets import load_from_disk
 
 # NOTE: hardcoded camera order for each camera elevation (counter clockwise)
 # use for trajectory NVS training!
@@ -235,7 +236,23 @@ class MVHumanNetDataset(Dataset):
         # actual data
         self.cam_params = {} # Dict[subject: (extrinsics, intrinsics, camera_scale)]
         self.face_bboxes = self._load_face_bboxes() if face_bbox_dir is not None else None # * needs to be loaded BEFORE scenes
-        self.scenes = self._load_preloaded_filepaths()
+        
+        # Detect if preload_path is an Arrow dataset
+        self.is_arrow = False
+        self.dataset = None
+        if self.preload_path and (self.preload_path.endswith('.arrow') or os.path.isdir(self.preload_path)):
+            # Check if it looks like an Arrow dataset (directory with metadata.json or similar)
+            if os.path.exists(os.path.join(self.preload_path, 'dataset_info.json')) or \
+               os.path.exists(os.path.join(self.preload_path, 'state.json')) or \
+               len(glob.glob(os.path.join(self.preload_path, '*.parquet'))) > 0:
+                self.is_arrow = True
+                print(f"Detected Arrow dataset at {self.preload_path}")
+        
+        if self.is_arrow:
+            self.scenes = self._load_scenes_arrow()
+        else:
+            self.scenes = self._load_preloaded_filepaths()
+            
         self.image_shape = (1500, 2048) # MVHumanNet images are 2048x1500
 
         # from SD 2.1 VAE
@@ -446,6 +463,71 @@ class MVHumanNetDataset(Dataset):
         print("Loading preloaded filepaths completed!")
         return scenes
 
+    def _load_scenes_arrow(self):
+        """
+        Load scenes from Arrow dataset (memory mapped).
+        Returns a list of scene metadata (subject_idx, timestep).
+        """
+        print("Loading Arrow dataset...")
+        self.dataset = load_from_disk(self.preload_path)
+        print(f"Loaded Arrow dataset with {len(self.dataset)} subjects")
+        
+        scenes = []
+        
+        subjects_with_latents = None
+        if self.latents_dir is not None:
+            subjects_with_latents = set([subject for subject in os.listdir(self.latents_dir) if os.path.exists(os.path.join(self.latents_dir, subject, f"{subject}.npz"))])
+            print(f"Found {len(subjects_with_latents)} subjects with latents")
+            
+        # Create lightweight index
+        for i in tqdm(range(len(self.dataset)), desc="Indexing Arrow dataset"):
+            # We need to check subject_id first to apply filters
+            # Accessing a single column is fast in Arrow
+            subject_id = self.dataset[i]['subject_id']
+            
+            if self.only_include is not None and subject_id not in self.only_include:
+                continue
+            if self.exclude is not None and subject_id in self.exclude:
+                continue
+            if self.data_limit is not None and len(scenes) >= self.data_limit * 100: # approx limit (subjects * timesteps)
+                 # This logic is slightly different from JSON loader which limits *subjects*
+                 # But we can check if we've processed enough subjects
+                 pass 
+                 
+            if (subjects_with_latents is not None and subject_id not in subjects_with_latents):
+                # print(f"Skipping subject {subject_id} because it does not have latents precomputed!")
+                continue
+
+            # Get timesteps for this subject
+            timesteps = self.dataset[i]['timesteps']
+            
+            # Apply step_size if needed (though likely already applied in dataset creation)
+            # Use all available timesteps in the dataset
+            # If the user wants to subsample further, we could do it here
+            # But assuming dataset is prepared with desired step_size
+            
+            for timestep in timesteps:
+                if isinstance(timestep, str) and timestep.endswith("_img.jpg"):
+                    timestep = int(timestep.split("_")[0])
+                
+                time_id = f"{timestep * 5:04d}"                
+                if isinstance(timestep, str):
+                    # e.g. "0005_img.jpg"
+                    time_id = timestep.split("_")[0] # "0005"
+                else:
+                    # Should not happen with Arrow dataset from preload_paths.py
+                    time_id = f"{timestep:04d}"
+
+                scenes.append({
+                    'subject_id': subject_id,
+                    'timestep': time_id,
+                    'arrow_idx': i, # Store index to retrieve row later
+                    'is_arrow': True
+                })
+
+        print(f"Loaded {len(scenes)} scenes from Arrow dataset")
+        return scenes
+
     #! DEPRECATED: online reading of the dataset takes many hours per run just to load!
     #! therefore, only use preloaded filepaths.
     def _load_scenes(self):
@@ -606,7 +688,7 @@ class MVHumanNetDataset(Dataset):
             del image, img_mask, masked_image # free PIL images
         return frames, img_masks
 
-    def _sample_multiview_image_paths(self, frames_info: dict, use_iclight: bool = False, use_infu: bool = False) -> Tuple[list[str], list[str], list[str]]:
+    def _sample_multiview_image_paths(self, frames_info: dict, use_iclight: bool = False, use_infu: bool = False) -> Tuple[list[str], list[str], list[str], Union[list[int], np.ndarray]]:
         """
         Sample multi-view frame + subject mask indices (as string paths) from a frames_info dictionary.
         Returns the sampled images, masks, and camera order.
@@ -983,8 +1065,15 @@ class MVHumanNetDataset(Dataset):
 
     def __len__(self):
         return len(self.scenes)
-    
+
     def __getitem__(self, idx):
+        try:
+            return self.create_batch(idx)
+        except Exception as e:
+            print(f"Error creating batch at index {idx}: {e}. Skipping this scene.")
+            return None
+    
+    def create_batch(self, idx):
         """
         Collect multi-views + conditioning data for a scene at a fixed timestep,
         preprocess for training loop.
@@ -992,17 +1081,73 @@ class MVHumanNetDataset(Dataset):
         scene = self.scenes[idx] # get scene content info
         subject_id = scene['subject_id'] # ex. 100001
         timestep = scene['timestep'] # ex. 0005
-        frames_info = dict(sorted(scene['frames_info'].items())) # camera dict data (annots)
-        subject_path = os.path.join(self.root_dir, subject_id)
+        
+        # Reconstruct frames_info and other metadata
+        if self.is_arrow:
+            row = self.dataset[scene['arrow_idx']]
+            
+            # Parse stored JSON metadata
+            extrinsics = json.loads(row['extrinsics'])
+            intrinsics = json.loads(row['intrinsics'])
+            camera_scale = float(row['camera_scale'])
+            
+            # Parse annots for bboxes
+            annots_bbox = json.loads(row['annots_bbox'])
+            annots_bbox_face = json.loads(row['annots_bbox_face2d'])
+            
+            # Reconstruct frames_info
+            frames_info = {}
+            cameras = row['cameras'] # List of camera IDs
+            subject_path = os.path.join(self.root_dir, subject_id)
+            
+            for camera in cameras:
+                # Create time_id matching the format in JSON/keys
+                # timestep is "0005" string
+                time_id = timestep 
+                
+                # Check if this camera has annotation for this timestep
+                if camera in annots_bbox and time_id in annots_bbox[camera]:
+                    bbox = annots_bbox[camera][time_id]
+                    bbox_face = [-1,-1,-1,-1]
+                    if camera in annots_bbox_face and time_id in annots_bbox_face[camera]:
+                        bbox_face = annots_bbox_face[camera][time_id]
+                        
+                    # Validate bbox (same check as in JSON loader)
+                    if (bbox[2] - bbox[0]) == 0 or (bbox[3] - bbox[1]) == 0:
+                        continue
 
-        # get camera parameters
-        extrinsics = self.cam_params[subject_id]['extrinsics']
-        intrinsics = np.array(self.cam_params[subject_id]['intrinsics'])
-        camera_scale = self.cam_params[subject_id]['camera_scale'] 
+                    # Construct paths                    
+                    image_filename = f"{time_id}_img.jpg"
+                    mask_filename = f"{time_id}_img_fmask.png"
+                    
+                    frames_info[camera] = {
+                        'image_path': os.path.join(subject_path, "images_lr", camera, image_filename),
+                        'mask_path': os.path.join(subject_path, "fmask_lr", camera, mask_filename),
+                        'annots': {
+                            'bbox': bbox,
+                            'bbox_face': bbox_face
+                        }
+                    }
+            
+            # Convert intrinsics list to array (if needed)
+            intrinsics = np.array(intrinsics['intrinsics'] if isinstance(intrinsics, dict) else intrinsics)
+            
+        else:
+            # Legacy JSON loader path
+            frames_info = dict(sorted(scene['frames_info'].items())) # camera dict data (annots)
+            subject_path = os.path.join(self.root_dir, subject_id)
+            # get camera parameters from cache
+            extrinsics = self.cam_params[subject_id]['extrinsics']
+            intrinsics = np.array(self.cam_params[subject_id]['intrinsics'])
+            camera_scale = self.cam_params[subject_id]['camera_scale'] 
 
         if self.pre_scale_intrinsics != 1:
             # update intrinsics (required for MVHumanNet; default 0.5x prescaling)
             intrinsics = update_intrinsics_resize(intrinsics, scale=self.pre_scale_intrinsics)
+            
+        # Ensure intrinsics is numpy array for downstream processing
+        if isinstance(intrinsics, list):
+             intrinsics = np.array(intrinsics)
 
         # Sample multi-view frame + subject mask indices (as string paths)
         img_paths, img_mask_paths, cam_order, sample_permutation = self._sample_multiview_image_paths(frames_info)
@@ -1169,6 +1314,12 @@ class MVHumanNetDataset(Dataset):
             raise
 
         return output_dict
+
+def custom_collate(batch):
+    batch = list(filter(lambda x: x is not None, batch))
+    if not batch:
+        return None
+    return torch.utils.data.default_collate(batch)
 
 def expand_only_include(only_include):
     if isinstance(only_include, str): # in the format ex: "100001-102000,102020-104000"
@@ -1353,7 +1504,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
             drop_last=True,
             pin_memory=True,
             persistent_workers=True if self.num_workers > 0 else False,
-            prefetch_factor=2 if self.num_workers > 0 else None
+            prefetch_factor=2 if self.num_workers > 0 else None,
+            collate_fn=custom_collate,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -1370,7 +1522,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
             drop_last=True,
             pin_memory=True,
             persistent_workers=True if self.num_workers > 0 else False,
-            prefetch_factor=2 if self.num_workers > 0 else None
+            prefetch_factor=2 if self.num_workers > 0 else None,
+            collate_fn=custom_collate,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -1382,5 +1535,6 @@ class MVHumanNetLoader(pl.LightningDataModule):
             drop_last=True,
             pin_memory=True,
             persistent_workers=True if self.num_workers > 0 else False,
-            prefetch_factor=2 if self.num_workers > 0 else None
+            prefetch_factor=2 if self.num_workers > 0 else None,
+            collate_fn=custom_collate,
         )

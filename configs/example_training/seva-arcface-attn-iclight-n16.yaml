@@ -5,6 +5,9 @@ model:
     scale_factor: 0.18215
     disable_first_stage_autocast: true
     input_key: clean_latent
+    ### match this with MVHumanNetLoader!
+    use_sapiens_conditioning: []
+    ###
     network_wrapper: sgm.modules.diffusionmodules.wrappers.SevaWrapper
     scheduler_config:
       target: sgm.lr_scheduler.LambdaLinearScheduler
@@ -35,7 +38,7 @@ model:
           params:
             load_pretrained: false # IMPORTANT: Set to false to avoid loading base weights that don't have IP-Adapter layers
             params:
-              in_channels: 16
+              in_channels: 16 # 16 + 5 (post projection: 4[seg_masks] + 1[depth])
               model_channels: 320
               out_channels: 4
               num_frames: 8
@@ -51,9 +54,11 @@ model:
               ckpt_path: null
               use_ip_adapter: True
               face_context_dim: 512 # This is the *input* dim to the projector
+              use_id_head: False
+              ip_lambda_weight: 1.0
         self_attn_rank: 256
         cross_attn_rank: 512
-        alpha: 128.0
+        alpha: 64.0
         dropout: 0.0
         target_modules:
         - TransformerBlockTimeMix
@@ -62,7 +67,8 @@ model:
         keys_to_lora: [ q, k, v ]
         excluded_modules: []
         ff_rank: 128
-        lora_for_face_attn_only: true
+        lora_for_face_attn_only: true # freeze all model weights except face attention (and LoRA)
+        freeze_lora: false
     conditioner_config:
       target: sgm.modules.GeneralConditioner
       params:
@@ -99,7 +105,7 @@ model:
           params:
             input_dim: 512
             cross_attn_dim: 1024
-            n_tokens: 4
+            n_tokens: 16
 
     first_stage_config:
       target: sgm.modules.encoders.modules.SevaAutoencoder
@@ -116,9 +122,10 @@ model:
             num_idx: 1000
             discretization_config:
               target: sgm.modules.diffusionmodules.discretizer.SevaDDPMDiscretization
-        face_weighting: 0.0
-        arcface_loss_weight: 1.0
+        face_weighting: 2.0
+        arcface_loss_weight: 0.0
         arcface_gt_key: "arcface_embedding"
+        background_downweight: 0.01
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler
       params:
@@ -134,21 +141,24 @@ data:
   target: seva.data.mvh_dataloader.MVHumanNetLoader
   params:
     root_dir: /workspace/datasetvol/mvhuman_data/mv_captures
-    batch_size: 2
+    batch_size: 6
     num_workers: 4
     num_images: 8
     step_size: 60
-    only_include: 100001-100010
-    val_include: 100011-100014
-    preload_path: /workspace/datasetvol/mvhuman_data/mv_captures/preloaded_filepaths1.json
+    only_include: 100001-104499
+    val_include: 104500-104800
+    preload_path: /workspace/datasetvol/mvhuman_data/preload_paths/shards
     iclight_dataset_path: /workspace/datasetvol/mvhuman_data/relit_images
-    infu_dataset_path: /workspace/datasetvol/mvhuman_data/inconsistent_images
-    # face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
+    infu_dataset_path: null
+    face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
     arcface_embeddings_dir: /workspace/datasetvol/mvhuman_data/arcface_embeddings # New path for arcface embeddings
+    ### match this with DiffusionEngine!
+    use_sapiens_conditioning: []
+    ###
     maximal_crop: true
     random_crop: true
     use_inconsistent: true
-    ic_sampling_prob: 0.7
+    ic_sampling_prob: 0.5
     fixed_sampling_ids: null
     exclude:
     - '102206'
@@ -167,7 +177,7 @@ lightning:
       params:
         disabled: false
         enable_autocast: false
-        batch_frequency: 20
+        batch_frequency: 250
         max_images: 8
         increase_log_steps: false
         log_first_step: false
