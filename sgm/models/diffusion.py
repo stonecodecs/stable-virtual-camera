@@ -531,6 +531,21 @@ class DiffusionEngine(pl.LightningModule):
 
         return loss
 
+    def on_after_backward(self):
+        for name, p in self.named_parameters():
+            if p.grad is not None:
+                grad_norm = p.grad.data.norm(2).item()
+                self.log(f"grad_norm/{name}", grad_norm,
+                         on_step=True, on_epoch=False, prog_bar=False)
+
+    def on_after_optimizer_step(self, optimizer, optimizer_idx):
+        for name, p in self.named_parameters():
+            if p.data is not None:
+                norm = p.data.norm(2).item()
+                self.log(f"param_norm_after_step/{name}",
+                         norm,
+                         on_step=True, on_epoch=False, prog_bar=False)
+
     def validation_step(self, batch, batch_idx):
         loss, loss_dict = self.shared_step(batch)
         # log averaged validation loss; keep per-step metrics off
