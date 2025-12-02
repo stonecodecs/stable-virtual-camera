@@ -177,7 +177,7 @@ lightning:
       params:
         disabled: false
         enable_autocast: false
-        batch_frequency: 1000
+        batch_frequency: 16
         max_images: 8
         increase_log_steps: false
         log_first_step: false
@@ -191,6 +191,6 @@ lightning:
     benchmark: false
     num_sanity_val_steps: 0
     accumulate_grad_batches: 1
-    max_epochs: 500
+    max_epochs: 2000
     precision: 16-mixed
     check_val_every_n_epoch: 1
