@@ -181,6 +181,7 @@ class MVHumanNetDataset(Dataset):
         fixed_sampling_ids=None,
         use_sapiens_conditioning=None, # list of "depth, seg, latents" later
         sapiens_segmentation_channels_to_use=[], # face
+        force_face_ref=False # if True, then will force the reference frame to be a face frame
     ):
         self.root_dir = root_dir             # directory of all subject directories
         self.latents_dir = latents_dir       # directory of all latents
@@ -216,6 +217,7 @@ class MVHumanNetDataset(Dataset):
         self.infu_dataset_path = infu_dataset_path # InfU output directory
         self.face_bbox_dir = face_bbox_dir # Face bounding box directory
         self.arcface_embeddings_dir = arcface_embeddings_dir # ArcFace embeddings directory
+        self.force_face_ref = force_face_ref
         # NOTE: currently we only have arcface_embeddings for MVHN gt dataset
     
         # if not None, will use the "phase 2" expected training process
@@ -865,7 +867,7 @@ class MVHumanNetDataset(Dataset):
             bbox_annot_scale = 0.5 if int(subject_id) < 103000 else 1.0
             bbox_params = torch.stack([torch.tensor(bbox) * bbox_annot_scale for bbox in crop_params])
 
-            face_params = torch.stack([torch.tensor(face_bbox) for face_bbox in face_bboxes_adjusted]) if self.face_bboxes is not None else torch.stack([torch.tensor([-1, -1, -1, -1]) for _ in range(self.num_images)])
+            face_params = torch.stack([torch.tensor(face_bbox) * bbox_annot_scale for face_bbox in face_bboxes_adjusted])
             frames, Ks, rel_bbox, face_bboxes_result, new_bbox, bbox_before_pad = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=face_params)
             # ! this is bugged; ensure that padding is correctly done 
             image_masks, _ = self.cropper._possibly_pad_img(image_masks.unsqueeze(1), bbox_before_pad[:,0], bbox_before_pad[:,1], bbox_before_pad[:,2], bbox_before_pad[:,3])
