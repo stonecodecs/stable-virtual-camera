@@ -404,30 +404,110 @@ def add_colored_border(img: torch.Tensor, color: tuple, border_width: int = 8):
     bordered[:, border_width:-border_width, border_width:-border_width] = img
     return bordered
 
-def show_tensor_batch(images: torch.Tensor, frames: torch.Tensor=None, masks=None, nrow=4, border_width=8):
+def show_tensor_batch(
+    images: torch.Tensor, 
+    frames: torch.Tensor = None, 
+    ref_mask=None,
+    input_mask=None,
+    nrow=4, 
+    border_width=24,
+    figsize=(16, 8),
+    padding=24,
+):
     """
-    images: Tensor [B, 3, H, W] in [-1, 1] or [0, 1]
-    masks: Optional Bool Tensor [B], True=red, False=blue
+    Display a batch of images as a grid with colored borders matching ImageLogger style.
+    
+    Args:
+        images: Tensor [B, 3, H, W] in [-1, 1] range
+        frames: Optional reference frames to substitute for ref_mask images
+        ref_mask: Optional Bool Tensor [B], True=green border (reference images)
+        input_mask: Optional Bool Tensor [B], True=red border (inputs), False=blue border (targets)
+        nrow: Number of images per row
+        border_width: Width of color border in pixels (default 24 to match logger)
+        figsize: Figure size for display
+        padding: Grid padding (default 24 to match logger)
     """
-
-    if masks is not None:
-        bordered_images = []
-        for i, img in enumerate(images):
-            img_ = img
-            color = (247, 121, 132) if masks[i] else (101, 174, 219)
-            if frames is not None and masks[i] == True: 
-                img_ = frames[i]
-            bordered_images.append(add_colored_border(img_, color, border_width))
-        images = torch.stack(bordered_images)
-
-    grid = torchvision.utils.make_grid(images, nrow=nrow, padding=16)
-    npimg = grid.permute(1, 2, 0).cpu().numpy().copy()
-    plt.figure(figsize=(24, 12))
-    plt.imshow(npimg)
+    import matplotlib.pyplot as plt
+    import torchvision
+    import numpy as np
+    from PIL import Image
+    
+    B = images.shape[0]
+    bordered_images = []
+    
+    # Process each image with appropriate border color
+    for i in range(B):
+        img = images[i]
+        
+        # Optionally replace ref_mask images with frames
+        if ref_mask is not None and frames is not None and bool(ref_mask[i]):
+            img = frames[i]
+        
+        # Determine border color based on masks (matching logger logic)
+        if input_mask is not None and bool(input_mask[i]):  # inputs
+            border_color = (247.0, 121.0, 132.0)  # red
+        else:  # targets
+            border_color = (101.0, 174.0, 219.0)  # blue
+        
+        # Override with green if ref image
+        if ref_mask is not None and bool(ref_mask[i]):
+            border_color = (0.0, 255.0, 0.0)  # green
+        
+        # Denormalize: (-1, 1) -> (0, 1)
+        # img = (img + 1.0) / 2.0
+        
+        # Add colored border
+        bordered_img = add_colored_border(img, border_color, border_width=border_width)
+        bordered_images.append(bordered_img)
+    
+    # Create grid matching logger format
+    grid = torchvision.utils.make_grid(bordered_images, nrow=nrow, padding=padding)
+    
+    # Convert to numpy for display
+    grid = grid.permute(1, 2, 0).squeeze(-1).cpu()
+    grid = grid.numpy()
+    grid = (grid * 255).astype(np.uint8)
+    
+    # Display
+    plt.figure(figsize=figsize)
+    plt.imshow(grid)
     plt.axis('off')
+    plt.tight_layout(pad=0)
     plt.show()
-    return npimg
+    
+    return grid
 
+
+def add_colored_border(img, color, border_width=24):
+    """
+    Add a colored border to an image tensor.
+    
+    Args:
+        img: Tensor [3, H, W] in [0, 1] range
+        color: Tuple (R, G, B) in [0, 255] range
+        border_width: Width of border in pixels
+    
+    Returns:
+        Tensor [3, H+2*border_width, W+2*border_width] with colored border
+    """
+    import torch.nn.functional as F
+    
+    # Normalize color to [0, 1]
+    color = torch.tensor([c / 255.0 for c in color], device=img.device, dtype=img.dtype)
+    
+    # Add padding
+    padded = F.pad(img, (border_width, border_width, border_width, border_width), value=0)
+    
+    # Create border mask
+    H, W = padded.shape[1:]
+    mask = torch.ones((H, W), device=img.device, dtype=torch.bool)
+    mask[border_width:-border_width, border_width:-border_width] = False
+    
+    # Apply border color
+    for c in range(3):
+        padded[c][mask] = color[c]
+    
+    return padded
 
 def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Compute Peak Signal-to-Noise Ratio between predicted and target images.

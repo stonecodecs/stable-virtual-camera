@@ -1300,6 +1300,8 @@ class MVHumanNetDataset(Dataset):
                 "K": Ks,
                 "use_inconsistent": self.use_inconsistent,
                 "face_bbox": face_bboxes_adjusted,  # Face bounding boxes [T, 4] in pixel coords (x1, y1, x2, y2)
+                "subject_id": subject_id,
+                "timestep": timestep,
                 # NOTE: face_bbox is w.r.t post-cropping, resized 576^2 image!
             }
             # NOTE: sapiens conditioning will be processed internally to 
