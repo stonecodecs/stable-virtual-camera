@@ -264,6 +264,8 @@ class DiffusionEngine(pl.LightningModule):
 
         # In DiffusionEngine.__init__, after self.conditioner initialization
         # Add sapiens conditioning projection layers
+        # this is if CONCATENATION is used by setting use_sapiens_conditioning in the config
+        # otherwise, we either ignore conditioning or use them as GT for network prediction
         self.sapiens_projections = torch.nn.ModuleDict()
         if hasattr(self, 'use_sapiens_conditioning') and self.use_sapiens_conditioning is not None:
             # You'll need to pass this as a config parameter

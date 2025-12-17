@@ -211,16 +211,6 @@ class Seva(nn.Module):
         else:
             self.arcface_head = None
 
-        # Enable heads if loss weights are > 0 (single config value controls both)
-        if params.depth_loss_weight > 0.0:
-            self.depth_head = DepthHead(in_channels=ch, out_channels=1)
-        else:
-            self.depth_head = None
-        if params.seg_loss_weight > 0.0:
-            self.seg_head = SegHead(in_channels=ch, out_channels=28)
-        else:
-            self.seg_head = None
-
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(params.channel_mult))[::-1]:
             for i in range(params.num_res_blocks + 1):
@@ -258,6 +248,18 @@ class Seva(nn.Module):
                     output_layers.append(Upsample(ch, out_ch))
                 self.output_blocks.append(TimestepEmbedSequential(*output_layers))
                 self._feature_size += ch
+
+        # Enable heads if loss weights are > 0 (single config value controls both)
+        # Heads are called on h after output blocks, where h has model_channels (320) channels
+        # After output blocks loop, ch = params.model_channels * 1 = 320
+        if params.depth_loss_weight > 0.0:
+            self.depth_head = DepthHead(in_channels=ch, out_channels=1)
+        else:
+            self.depth_head = None
+        if params.seg_loss_weight > 0.0:
+            self.seg_head = SegHead(in_channels=ch, out_channels=28)
+        else:
+            self.seg_head = None
 
         self.out = nn.Sequential(
             GroupNorm32(32, ch),
@@ -356,6 +358,7 @@ class Seva(nn.Module):
         if self.seg_head is not None:
             self.seg_pred = self.seg_head(h)
         else: self.seg_pred = None
+        
         return self.out(h) # [B*num_images, C=4, H=72, W=72]
 
 

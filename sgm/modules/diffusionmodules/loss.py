@@ -473,8 +473,8 @@ class StandardDiffusionLoss(nn.Module):
         if depth_pred is None:
             return torch.tensor(0.0, device=device, dtype=dtype)
 
-        B, T = depth_pred.shape[:2]
-        depth_pred = depth_pred.reshape(B, T, 1, *depth_pred.shape[-2:])
+        B, T = batch['mask'].shape[:2]
+        depth_pred = depth_pred.reshape(B, T, *depth_pred.shape[-3:])
 
         sapiens_conditioning = batch.get("sapiens_conditioning")
         if sapiens_conditioning is None or "depth" not in sapiens_conditioning:
@@ -519,8 +519,10 @@ class StandardDiffusionLoss(nn.Module):
             gt_seg_indices = gt_seg.argmax(dim=2)  # [B, T, H, W]
         else:
             gt_seg_indices = gt_seg.squeeze(2)  # [B, T, H, W]
-        
-        B, T = gt_seg_indices.shape[:2]
+    
+        B, T = batch['mask'].shape[:2]
+        seg_pred = seg_pred.reshape(B, T, *seg_pred.shape[-3:])
+
         gt_seg_resized = F.interpolate(
             gt_seg_indices.unsqueeze(2).float().view(B * T, 1, *gt_seg_indices.shape[2:]),
             size=seg_pred.shape[-2:],
