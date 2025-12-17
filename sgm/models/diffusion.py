@@ -178,6 +178,57 @@ class DiffusionEngine(pl.LightningModule):
             model, compile_model=compile_model
         )
 
+        # Extract loss weights from model config and merge into loss_fn_config
+        # This allows a single config value to control both head enabling and loss weighting
+        if loss_fn_config is not None:
+            # Get Seva model to extract loss weights
+            # The model structure is: SevaWrapper -> SevaLoRAWrapper -> Seva
+            seva_model = None
+            # Try to get Seva model from wrapped structure
+            if hasattr(self.model, "diffusion_model") and hasattr(
+                self.model.diffusion_model, "seva_model"
+            ):
+                # After SevaWrapper is applied: self.model.diffusion_model is SevaLoRAWrapper
+                seva_model = self.model.diffusion_model.seva_model
+            elif hasattr(model, "seva_model"):
+                # Direct SevaLoRAWrapper (before SevaWrapper is applied)
+                seva_model = model.seva_model
+            elif hasattr(model, "params") and hasattr(model.params, "depth_loss_weight"):
+                # Direct Seva model (unlikely but possible)
+                seva_model = model
+            
+            if seva_model is not None and hasattr(seva_model, "params") and seva_model.params is not None:
+                # Merge loss weights from model into loss config
+                # Work directly with OmegaConf if possible to preserve structure
+                was_omegaconf = isinstance(loss_fn_config, (OmegaConf, ListConfig))
+                
+                if was_omegaconf:
+                    # Work directly with OmegaConf to preserve all keys
+                    # Ensure params exists
+                    if "params" not in loss_fn_config:  # type: ignore
+                        loss_fn_config.params = OmegaConf.create({})  # type: ignore
+                    
+                    # Only set if not already present (loss config takes precedence)
+                    if "depth_loss_weight" not in loss_fn_config.params:  # type: ignore
+                        loss_fn_config.params.depth_loss_weight = seva_model.params.depth_loss_weight  # type: ignore
+                    if "seg_loss_weight" not in loss_fn_config.params:  # type: ignore
+                        loss_fn_config.params.seg_loss_weight = seva_model.params.seg_loss_weight  # type: ignore
+                else:
+                    # Handle dict case - preserve all original keys
+                    loss_config_dict = dict(loss_fn_config) if loss_fn_config else {}
+                    
+                    # Ensure params exists
+                    if "params" not in loss_config_dict:
+                        loss_config_dict["params"] = {}
+                    
+                    # Only set if not already present (loss config takes precedence)
+                    if "depth_loss_weight" not in loss_config_dict["params"]:
+                        loss_config_dict["params"]["depth_loss_weight"] = seva_model.params.depth_loss_weight
+                    if "seg_loss_weight" not in loss_config_dict["params"]:
+                        loss_config_dict["params"]["seg_loss_weight"] = seva_model.params.seg_loss_weight
+                    
+                    loss_fn_config = loss_config_dict
+
         self.denoiser = instantiate_from_config(denoiser_config)
         self.sampler = (
             instantiate_from_config(sampler_config)
@@ -345,15 +396,15 @@ class DiffusionEngine(pl.LightningModule):
         Outputs the original clean_latents (x) and the prepared batch.
         """
         x = self.get_input(batch)
-        if len(x.shape) == 1: # latents are NOT computed yet
+        if len(x.shape) == 1: # scalar indicates latents are NOT computed yet (=> on the fly)
             x = batch["frames"].to(self.device)
             batch_latents = []
             for b in x:
                 batch_latents.append(self.encode_first_stage(b))
             x = torch.stack(batch_latents, dim=0)
-            batch["clean_latent"] = x
-        else: #latents already precomputed (same as "IdentityEncoder")
-            batch["clean_latent"] = x * self.scale_factor # need to scale!
+            batch["clean_latent"] = x # already scaled internally to encode first stage
+        else: # latents already precomputed (same as "IdentityEncoder")
+            batch["clean_latent"] = x * self.scale_factor # still need to scale!
 
         # encode ic latents from the paths (scales)
         if torch.any(batch["use_inconsistent"]).item():

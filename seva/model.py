@@ -52,12 +52,12 @@ class DepthHead(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.head = nn.Sequential([
+        self.head = nn.Sequential(
             nn.GroupNorm(32, in_channels),
             nn.SiLU(),
             nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
             nn.Conv2d(in_channels, out_channels, 1)
-        ])
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(x)
@@ -67,12 +67,12 @@ class SegHead(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.head = nn.Sequential([
+        self.head = nn.Sequential(
             nn.GroupNorm(32, in_channels),
             nn.SiLU(),
             nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
             nn.Conv2d(in_channels, out_channels, 1)
-        ])
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(x)
@@ -100,6 +100,8 @@ class SevaParams(object):
     face_context_dim: int = 512
     use_id_head: bool = True
     ip_lambda_weight: float = 1.0
+    depth_loss_weight: float = 0.0  # If > 0, enables depth head and sets loss weight
+    seg_loss_weight: float = 0.0    # If > 0, enables seg head and sets loss weight
     def __post_init__(self):
         assert len(self.channel_mult) == len(self.transformer_depth)
 
@@ -209,11 +211,12 @@ class Seva(nn.Module):
         else:
             self.arcface_head = None
 
-        if params.depth_head_weight > 0.0:
+        # Enable heads if loss weights are > 0 (single config value controls both)
+        if params.depth_loss_weight > 0.0:
             self.depth_head = DepthHead(in_channels=ch, out_channels=1)
         else:
             self.depth_head = None
-        if params.seg_head_weight > 0.0:
+        if params.seg_loss_weight > 0.0:
             self.seg_head = SegHead(in_channels=ch, out_channels=28)
         else:
             self.seg_head = None
