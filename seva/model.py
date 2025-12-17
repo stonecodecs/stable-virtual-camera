@@ -46,6 +46,37 @@ class ArcFaceHead(nn.Module):
         x = x.reshape(-1, self.num_images, self.out_channels) # ! 8 hardcoded for now
         return x
 
+# small heads for depth and segmentation output
+class DepthHead(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int = 1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.head = nn.Sequential([
+            nn.GroupNorm(32, in_channels),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, out_channels, 1)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)
+
+class SegHead(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int = 28):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.head = nn.Sequential([
+            nn.GroupNorm(32, in_channels),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, out_channels, 1)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)
+
 
 @dataclass
 class SevaParams(object):
@@ -178,6 +209,15 @@ class Seva(nn.Module):
         else:
             self.arcface_head = None
 
+        if params.depth_head_weight > 0.0:
+            self.depth_head = DepthHead(in_channels=ch, out_channels=1)
+        else:
+            self.depth_head = None
+        if params.seg_head_weight > 0.0:
+            self.seg_head = SegHead(in_channels=ch, out_channels=28)
+        else:
+            self.seg_head = None
+
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(params.channel_mult))[::-1]:
             for i in range(params.num_res_blocks + 1):
@@ -304,6 +344,15 @@ class Seva(nn.Module):
                 face_context=face_context,
             )
         h = h.type(x.dtype)
+
+        # NOTE: these are in latent spatial resolution; need upsample to compare with loss
+        if self.depth_head is not None:
+            self.depth_pred = self.depth_head(h)
+        else: self.depth_pred = None
+
+        if self.seg_head is not None:
+            self.seg_pred = self.seg_head(h)
+        else: self.seg_pred = None
         return self.out(h) # [B*num_images, C=4, H=72, W=72]
 
 

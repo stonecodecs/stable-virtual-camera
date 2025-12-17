@@ -61,6 +61,8 @@ class StandardDiffusionLoss(nn.Module):
         arcface_loss_weight: float = 0.0,
         arcface_gt_key: str = "arcface_embedding",
         background_downweight: float = 0.0,
+        depth_loss_weight: float = 0.0,
+        seg_loss_weight: float = 0.0,
         **kwargs, # absorb unknown keys
     ):
         super().__init__()
@@ -77,7 +79,8 @@ class StandardDiffusionLoss(nn.Module):
         self.arcface_loss_weight = arcface_loss_weight
         self.arcface_gt_key = arcface_gt_key
         self.background_downweight = background_downweight
-
+        self.depth_loss_weight = depth_loss_weight
+        self.seg_loss_weight = seg_loss_weight
         # Store reference to first_stage_model for RGB decoding (set externally)
         self.first_stage_model = None
         self.scale_factor = None
@@ -170,6 +173,27 @@ class StandardDiffusionLoss(nn.Module):
                 network.diffusion_model.seva_model.predicted_arcface_embedding = None
             else:
                 network.predicted_arcface_embedding = None
+
+        # Add depth and segmentation losses if enabled
+        if self.training and self.depth_loss_weight > 0.0:
+            depth_loss = self.get_depth_loss(network, batch)
+            loss = loss + self.depth_loss_weight * depth_loss
+            if hasattr(network, "diffusion_model") and hasattr(
+                network.diffusion_model, "seva_model"
+            ):
+                network.diffusion_model.seva_model.depth_pred = None
+            else:
+                network.depth_pred = None
+
+        if self.training and self.seg_loss_weight > 0.0:
+            seg_loss = self.get_seg_loss(network, batch)
+            loss = loss + self.seg_loss_weight * seg_loss
+            if hasattr(network, "diffusion_model") and hasattr(
+                network.diffusion_model, "seva_model"
+            ):
+                network.diffusion_model.seva_model.seg_pred = None
+            else:
+                network.seg_pred = None
 
         return loss
 
@@ -428,6 +452,86 @@ class StandardDiffusionLoss(nn.Module):
         # chunk_size = 4 -- use later if no space
         lpips_loss = self.lpips(resized_pred_crops, padded_gt_rgbs)
         return lpips_loss.mean()
+
+    def get_depth_loss(self, network: nn.Module, batch: Dict) -> torch.Tensor:
+        """
+        Get L1 loss for network depth predictions against GT "sapiens" depth maps.
+        """
+        device = next(network.parameters()).device
+        dtype = next(network.parameters()).dtype
+
+         # The path to the Seva model might vary depending on wrappers
+        if hasattr(network, "diffusion_model") and hasattr(
+            network.diffusion_model, "seva_model"
+        ):
+            depth_pred = (
+                network.diffusion_model.seva_model.depth_pred
+            )
+        else:
+            depth_pred = network.depth_pred
+
+        if depth_pred is None:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        B, T = depth_pred.shape[:2]
+        depth_pred = depth_pred.reshape(B, T, 1, *depth_pred.shape[-2:])
+
+        sapiens_conditioning = batch.get("sapiens_conditioning")
+        if sapiens_conditioning is None or "depth" not in sapiens_conditioning:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        
+        gt_depth = sapiens_conditioning["depth"]
+        # resize gt_depth to depth_pred spatially
+        gt_depth_resized = F.interpolate(
+            gt_depth.view(B * T, *gt_depth.shape[2:]),
+            size=depth_pred.shape[-2:],
+            mode='bilinear',
+            align_corners=False
+        ).view(B, T, 1, *depth_pred.shape[-2:])
+
+        return F.l1_loss(depth_pred, gt_depth, reduction='none').mean(dim=(2, 3, 4)).mean(dim=1)
+        
+    def get_seg_loss(self, network: nn.Module, batch: Dict) -> torch.Tensor:
+        """
+        Get L1 loss for network segmentation predictions against GT "sapiens" segmentation maps.
+        """
+        device = next(network.parameters()).device
+        dtype = next(network.parameters()).dtype
+
+        # The path to the Seva model might vary depending on wrappers
+        if hasattr(network, "diffusion_model") and hasattr(
+            network.diffusion_model, "seva_model"
+        ):
+            seg_pred = (
+                network.diffusion_model.seva_model.seg_pred
+            )
+        else:
+            seg_pred = network.seg_pred
+        
+        sapiens_conditioning = batch.get("sapiens_conditioning")
+        if seg_pred is None or sapiens_conditioning is None or "seg_masks" not in sapiens_conditioning:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
+        gt_seg = sapiens_conditioning["seg_masks"]
+        # Convert one-hot to class indices for cross-entropy
+        # gt_seg is one-hot: [B, T, C, H, W] -> class indices: [B, T, H, W]
+        if gt_seg.shape[2] > 1:  # One-hot encoded
+            gt_seg_indices = gt_seg.argmax(dim=2)  # [B, T, H, W]
+        else:
+            gt_seg_indices = gt_seg.squeeze(2)  # [B, T, H, W]
+        
+        B, T = gt_seg_indices.shape[:2]
+        gt_seg_resized = F.interpolate(
+            gt_seg_indices.unsqueeze(2).float().view(B * T, 1, *gt_seg_indices.shape[2:]),
+            size=seg_pred.shape[-2:],
+            mode='nearest',
+            align_corners=False
+        ).squeeze(1).long()  # [B*T, H, W]
+
+        seg_loss = F.cross_entropy(seg_pred, gt_seg_resized, reduction='none')  # [B*T, H, W]
+        seg_loss = seg_loss.mean(dim=(1, 2))  # [B*T]
+        seg_loss = seg_loss.view(B, T).mean(dim=1)  # [B,]
+        return seg_loss
 
 def interpolate_weights_batch(bools: torch.Tensor, max_weight=5.0) -> torch.Tensor:
     B, N = bools.shape
