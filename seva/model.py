@@ -257,7 +257,7 @@ class Seva(nn.Module):
         else:
             self.depth_head = None
         if params.seg_loss_weight > 0.0:
-            self.seg_head = SegHead(in_channels=ch, out_channels=28)
+            self.seg_head = SegHead(in_channels=ch, out_channels=28)  # 28 classes for cross-entropy loss
         else:
             self.seg_head = None
 
