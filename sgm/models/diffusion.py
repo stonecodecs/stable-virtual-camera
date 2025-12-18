@@ -161,7 +161,8 @@ class DiffusionEngine(pl.LightningModule):
         en_and_decode_n_samples_a_time: Optional[int] = None,
         verbose_lora_deltas: bool = False,
         strict_loading: bool = True,
-        use_sapiens_conditioning: list = [],
+        use_sapiens_conditioning: list = [],  # Deprecated: use concatenate_sapiens_conditioning instead
+        concatenate_sapiens_conditioning: list = [],  # For concatenation to input
         sapiens_segmentation_channels_to_use: list = [],
     ):
         super().__init__()
@@ -169,7 +170,8 @@ class DiffusionEngine(pl.LightningModule):
         self.log_keys = log_keys
         self.input_key = input_key
         self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
-        self.use_sapiens_conditioning = use_sapiens_conditioning
+        # Support both old and new parameter names for backward compatibility
+        self.concatenate_sapiens_conditioning = concatenate_sapiens_conditioning if concatenate_sapiens_conditioning else use_sapiens_conditioning
         self.optimizer_config = default(
             optimizer_config, {"target": "torch.optim.AdamW"}
         )
@@ -264,13 +266,13 @@ class DiffusionEngine(pl.LightningModule):
 
         # In DiffusionEngine.__init__, after self.conditioner initialization
         # Add sapiens conditioning projection layers
-        # this is if CONCATENATION is used by setting use_sapiens_conditioning in the config
+        # this is if CONCATENATION is used by setting concatenate_sapiens_conditioning in the config
         # otherwise, we either ignore conditioning or use them as GT for network prediction
         self.sapiens_projections = torch.nn.ModuleDict()
-        if hasattr(self, 'use_sapiens_conditioning') and self.use_sapiens_conditioning is not None:
+        if hasattr(self, 'concatenate_sapiens_conditioning') and self.concatenate_sapiens_conditioning is not None and len(self.concatenate_sapiens_conditioning) > 0:
             # You'll need to pass this as a config parameter
             # For now, assuming you know the input/output channels
-            for cond_type in self.use_sapiens_conditioning:
+            for cond_type in self.concatenate_sapiens_conditioning:
                 if cond_type == "depth":
                     in_channels = 1
                     out_channels = 1

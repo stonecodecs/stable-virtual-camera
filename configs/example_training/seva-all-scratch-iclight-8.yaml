@@ -6,7 +6,8 @@ model:
     disable_first_stage_autocast: true
     input_key: clean_latent
     ### match this with MVHumanNetLoader!
-    use_sapiens_conditioning: [ "depth", "seg_masks" ]
+    concatenate_sapiens_conditioning: []
+    sapiens_mask_loss: ["depth", "seg_masks"]
     ###
     network_wrapper: sgm.modules.diffusionmodules.wrappers.SevaWrapper
     scheduler_config:

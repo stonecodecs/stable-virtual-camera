@@ -6,7 +6,8 @@ model:
     disable_first_stage_autocast: true
     input_key: clean_latent
     ### match this with MVHumanNetLoader!
-    use_sapiens_conditioning: []
+    concatenate_sapiens_conditioning: []
+    sapiens_mask_loss: ["depth", "seg_masks"]
     ###
     network_wrapper: sgm.modules.diffusionmodules.wrappers.SevaWrapper
     scheduler_config:
@@ -155,7 +156,8 @@ data:
     # face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
     arcface_embeddings_dir: /workspace/datasetvol/mvhuman_data/arcface_embeddings # New path for arcface embeddings
     ### match this with DiffusionEngine!
-    use_sapiens_conditioning: []
+    concatenate_sapiens_conditioning: []
+    sapiens_mask_loss: ["depth", "seg_masks"]
     ###
     maximal_crop: true
     random_crop: true
