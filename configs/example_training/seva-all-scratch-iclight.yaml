@@ -7,7 +7,7 @@ model:
     input_key: clean_latent
     ### match this with MVHumanNetLoader!
     concatenate_sapiens_conditioning: []
-    sapiens_mask_loss: ["depth", "seg_masks"]
+    sapiens_mask_loss_types: ["depth", "seg_masks"]
     ###
     network_wrapper: sgm.modules.diffusionmodules.wrappers.SevaWrapper
     scheduler_config:
@@ -157,7 +157,7 @@ data:
     arcface_embeddings_dir: /workspace/datasetvol/mvhuman_data/arcface_embeddings # New path for arcface embeddings
     ### match this with DiffusionEngine!
     concatenate_sapiens_conditioning: []
-    sapiens_mask_loss: ["depth", "seg_masks"]
+    sapiens_mask_loss_types: ["depth", "seg_masks"]
     ###
     maximal_crop: true
     random_crop: true

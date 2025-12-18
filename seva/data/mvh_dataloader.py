@@ -180,6 +180,7 @@ class MVHumanNetDataset(Dataset):
         ic_sampling_prob=0.7, # probability of randomly sampling from InfU over IC light
         fixed_sampling_ids=None,
         concatenate_sapiens_conditioning=None, # list of "depth, seg, latents" later
+        sapiens_mask_loss_types=[], # list of "depth, seg, latents" later (for loss)
         sapiens_segmentation_channels_to_use=[], # face
         force_face_ref=False # if True, then will force the reference frame to be a face frame
     ):
@@ -208,6 +209,7 @@ class MVHumanNetDataset(Dataset):
         self.concatenate_sapiens_conditioning = concatenate_sapiens_conditioning
         assert self.concatenate_sapiens_conditioning is None or all(cond in ["depth", "seg_masks", "latents"] for cond in self.concatenate_sapiens_conditioning), "Invalid sapiens conditioning!"
         self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
+        self.sapiens_mask_loss_types = sapiens_mask_loss_types
         self.fixed_sampling_ids = fixed_sampling_ids
         self.adjacent_frame_sampling_prob = 0.2 # Trajectory NVS acceptance rate
         self.all_inputs_prob = 0.85
@@ -938,10 +940,11 @@ class MVHumanNetDataset(Dataset):
                 ic_rgb_tensor[i] = ic_image_
 
                 # same for the sapiens conditionings
-                if self.concatenate_sapiens_conditioning is not None:
-                    # only the ref images are cropped in this way
+                if self.concatenate_sapiens_conditioning is not None or len(self.sapiens_mask_loss_types) > 0:
+                    # only the ref images are cropped in this way   
                     ref_idx = torch.where(ref_mask == True)[0][0].item()
-                    for cond in self.concatenate_sapiens_conditioning:
+                    types = self.concatenate_sapiens_conditioning if len(self.concatenate_sapiens_conditioning) > 0 else self.sapiens_mask_loss_types
+                    for cond in types:
                         cond_tensor = sapiens_conditionings[cond][i]
                         if ref_idx == i:
                             # if MVHN, crop using new_bbox 
@@ -977,8 +980,9 @@ class MVHumanNetDataset(Dataset):
             image_masks = torch.stack(image_masks, dim=0)
 
             # frames = torch.stack(frames, dim=0) # resize to 576x576 normalized [-1, 1] image tensors
-            if self.concatenate_sapiens_conditioning is not None:
-                for cond in self.concatenate_sapiens_conditioning:
+            if self.concatenate_sapiens_conditioning is not None or len(self.concatenate_sapiens_conditioning) > 0:
+                types = self.concatenate_sapiens_conditioning if len(self.concatenate_sapiens_conditioning) > 0 else self.sapiens_mask_loss_types
+                for cond in types:
                     for is_ref, cond_tensor in zip(ref_mask, sapiens_conditionings[cond]):
                         cond_tensor = T.Resize((self.target_shape[0], self.target_shape[1]))(cond_tensor) # both follows this old behavior
                         if cond == "seg_masks":
@@ -1033,8 +1037,9 @@ class MVHumanNetDataset(Dataset):
         """
          # get sapiens conditionings; NOTE: these are of original image size (need to crop later)
         sapiens_conditionings = {}
-        if self.concatenate_sapiens_conditioning is not None:
-            for cond in self.concatenate_sapiens_conditioning:
+        if self.concatenate_sapiens_conditioning is not None or len(self.sapiens_mask_loss_types) > 0:
+            types = self.concatenate_sapiens_conditioning if len(self.concatenate_sapiens_conditioning) > 0 else self.sapiens_mask_loss_types
+            for cond in types:
                 sapiens_conditionings[cond] = []
                 for is_ref, is_iclight, is_infu, camera, ic_path in zip(ref_mask, ic_masks['iclight'], ic_masks['infu'], cam_order, ic_paths):
                     try: 
@@ -1311,7 +1316,8 @@ class MVHumanNetDataset(Dataset):
                 output_dict["arcface_embedding"] = arcface_embeddings  # [T, 512]
                 # where None values are replaced with zero tensor
 
-            if self.concatenate_sapiens_conditioning is not None:
+            if self.concatenate_sapiens_conditioning is not None \
+                or len(self.sapiens_mask_loss_types) > 0:
                 output_dict["sapiens_conditioning"] = sapiens_conditionings
         except Exception as e:
             print(f"Error creating output_dict: {e}")
@@ -1364,6 +1370,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
         fixed_sampling_ids: list = None,
         concatenate_sapiens_conditioning: list = None,
         sapiens_segmentation_channels_to_use: list = None,
+        sapiens_mask_loss_types: list = None,
     ):
         super().__init__()
         print("init of DATALOADER")
@@ -1391,6 +1398,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
         self.fixed_sampling_ids = fixed_sampling_ids
         self.concatenate_sapiens_conditioning = concatenate_sapiens_conditioning
         self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
+        self.sapiens_mask_loss_types = sapiens_mask_loss_types if sapiens_mask_loss_types is not None else []
         # Define transforms
         # self.transform = T.Compose([
         #     T.Resize(image_size), # whatever final resolution we want here
@@ -1443,6 +1451,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 fixed_sampling_ids=self.fixed_sampling_ids,
                 concatenate_sapiens_conditioning=self.concatenate_sapiens_conditioning,
                 sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
+                sapiens_mask_loss_types=self.sapiens_mask_loss_types,
             )
 
         if stage == "validate" or stage is None:
@@ -1469,6 +1478,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 fixed_sampling_ids=self.fixed_sampling_ids,
                 concatenate_sapiens_conditioning=self.concatenate_sapiens_conditioning,
                 sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
+                sapiens_mask_loss_types=self.sapiens_mask_loss_types,
             )
         if stage == "test" or stage is None:
             self.test_dataset = MVHumanNetDataset(
@@ -1493,6 +1503,7 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 fixed_sampling_ids=self.fixed_sampling_ids,
                 concatenate_sapiens_conditioning=self.concatenate_sapiens_conditioning,
                 sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
+                sapiens_mask_loss_types=self.sapiens_mask_loss_types,
             )
             
     def prepare_data(self):

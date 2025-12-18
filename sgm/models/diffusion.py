@@ -163,6 +163,7 @@ class DiffusionEngine(pl.LightningModule):
         strict_loading: bool = True,
         use_sapiens_conditioning: list = [],  # Deprecated: use concatenate_sapiens_conditioning instead
         concatenate_sapiens_conditioning: list = [],  # For concatenation to input
+        sapiens_mask_loss_types: list = [], # use for the depth/seg head loss
         sapiens_segmentation_channels_to_use: list = [],
     ):
         super().__init__()
@@ -263,15 +264,13 @@ class DiffusionEngine(pl.LightningModule):
 
         self.en_and_decode_n_samples_a_time = en_and_decode_n_samples_a_time
         self.verbose_lora_deltas = verbose_lora_deltas
+        self.sapiens_mask_loss_types = sapiens_mask_loss_types if sapiens_mask_loss_types is not None else []
 
-        # In DiffusionEngine.__init__, after self.conditioner initialization
         # Add sapiens conditioning projection layers
         # this is if CONCATENATION is used by setting concatenate_sapiens_conditioning in the config
         # otherwise, we either ignore conditioning or use them as GT for network prediction
         self.sapiens_projections = torch.nn.ModuleDict()
         if hasattr(self, 'concatenate_sapiens_conditioning') and self.concatenate_sapiens_conditioning is not None and len(self.concatenate_sapiens_conditioning) > 0:
-            # You'll need to pass this as a config parameter
-            # For now, assuming you know the input/output channels
             for cond_type in self.concatenate_sapiens_conditioning:
                 if cond_type == "depth":
                     in_channels = 1

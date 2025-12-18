@@ -489,7 +489,7 @@ class StandardDiffusionLoss(nn.Module):
             align_corners=False
         ).view(B, T, 1, *depth_pred.shape[-2:])
 
-        return F.l1_loss(depth_pred, gt_depth, reduction='none').mean(dim=(2, 3, 4)).mean(dim=1)
+        return F.l1_loss(depth_pred, gt_depth_resized, reduction='none').mean(dim=(2, 3, 4)).mean(dim=1)
         
     def get_seg_loss(self, network: nn.Module, batch: Dict) -> torch.Tensor:
         """
@@ -515,19 +515,18 @@ class StandardDiffusionLoss(nn.Module):
         gt_seg = sapiens_conditioning["seg_masks"]
         # Convert one-hot to class indices for cross-entropy
         # gt_seg is one-hot: [B, T, C, H, W] -> class indices: [B, T, H, W]
-        if gt_seg.shape[2] > 1:  # One-hot encoded
+        if gt_seg.shape[3] > 1:  # One-hot encoded
             gt_seg_indices = gt_seg.argmax(dim=2)  # [B, T, H, W]
         else:
             gt_seg_indices = gt_seg.squeeze(2)  # [B, T, H, W]
     
         B, T = batch['mask'].shape[:2]
-        seg_pred = seg_pred.reshape(B, T, *seg_pred.shape[-3:])
+        seg_pred = seg_pred.reshape(B, T, *seg_pred.shape[-3:]) # [BT, C, H, W]
 
         gt_seg_resized = F.interpolate(
-            gt_seg_indices.unsqueeze(2).float().view(B * T, 1, *gt_seg_indices.shape[2:]),
+            gt_seg_indices.unsqueeze(2).float().view(B, T, 1, *gt_seg_indices.shape[2:]),
             size=seg_pred.shape[-2:],
             mode='nearest',
-            align_corners=False
         ).squeeze(1).long()  # [B*T, H, W]
 
         seg_loss = F.cross_entropy(seg_pred, gt_seg_resized, reduction='none')  # [B*T, H, W]

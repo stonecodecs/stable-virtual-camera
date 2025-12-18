@@ -350,7 +350,8 @@ class Seva(nn.Module):
             )
         h = h.type(x.dtype)
 
-        # NOTE: these are in latent spatial resolution; need upsample to compare with loss
+        # NOTE: these are in latent spatial resolution
+        # currently, the GTs will be downsampled to match for the loss
         if self.depth_head is not None:
             self.depth_pred = self.depth_head(h)
         else: self.depth_pred = None
