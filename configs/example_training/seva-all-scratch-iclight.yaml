@@ -183,7 +183,7 @@ lightning:
         enable_autocast: false
         batch_frequency: 1000
         max_images: 8
-        increase_log_steps: false
+        increase_log_steps: True
         log_first_step: false
         log_train: true
         log_images_kwargs:

@@ -461,6 +461,12 @@ class ImageLogger(Callback):
             for k in images:
                 if k == "inputs":
                     continue  # Already in RGB space
+                if k in ["depth_pred", "seg_pred", "depth_gt", "seg_gt"]:
+                    # These are already RGB visualizations, just format conversion
+                    images[k] = self._convert_valid_log_format(images[k], images["inputs"])
+                    # Normalize from [0, 1] to [-1, 1] to match other images
+                    images[k] = images[k] * 2.0 - 1.0
+                    continue
                 if isinstance(images[k], torch.Tensor):
                     # assuming we use AutoencoderKL
                     if isinstance(self.cpu_decoder, AutoencoderKL):
@@ -527,6 +533,51 @@ class ImageLogger(Callback):
                 self.logger.warning("[ImageLogger] Warning: Log thread did not stop gracefully")
         
         self.logger.info("[ImageLogger] Logging thread shutdown complete")
+    
+    def _get_seva_model(self, pl_module):
+        """Helper to get Seva model from wrapped structure"""
+        if hasattr(pl_module.model, "diffusion_model") and hasattr(
+            pl_module.model.diffusion_model, "seva_model"
+        ):
+            return pl_module.model.diffusion_model.seva_model
+        elif hasattr(pl_module.model, "seva_model"):
+            return pl_module.model.seva_model
+        return None
+    
+    def _visualize_depth(self, depth_map):
+        """Convert depth map [B, 1, H, W] or [B, H, W] to RGB [B, 3, H, W] using viridis colormap"""
+        if depth_map.dim() == 4:
+            depth_map = depth_map.squeeze(1)  # [B, H, W]
+        
+        # Normalize per-image
+        B = depth_map.shape[0]
+        depth_norm = torch.zeros_like(depth_map)
+        for b in range(B):
+            d = depth_map[b]
+            d_min, d_max = d.min(), d.max()
+            if d_max > d_min:
+                depth_norm[b] = (d - d_min) / (d_max - d_min)
+        
+        # Apply colormap
+        depth_norm_np = depth_norm.cpu().numpy()
+        cmap = cm.get_cmap('viridis')
+        colored = cmap(depth_norm_np)[..., :3]  # [B, H, W, 3]
+        colored = torch.from_numpy(colored).float()
+        colored = colored.permute(0, 3, 1, 2)  # [B, 3, H, W]
+        return colored
+
+    def _visualize_segmentation(self, seg_logits):
+        """Convert segmentation logits [B, C, H, W] to RGB [B, 3, H, W]"""
+        seg_indices = seg_logits.argmax(dim=1)  # [B, H, W]
+        num_classes = seg_logits.shape[1]
+        seg_norm = seg_indices.float() / max(num_classes - 1, 1)
+        
+        seg_norm_np = seg_norm.cpu().numpy()
+        cmap = cm.get_cmap('tab20')
+        colored = cmap(seg_norm_np)[..., :3]
+        colored = torch.from_numpy(colored).float()
+        colored = colored.permute(0, 3, 1, 2)
+        return colored
     
     def diffmap(self, img1, img2, output_path=None):
         """
@@ -1002,6 +1053,87 @@ class ImageLogger(Callback):
                 pre_images["reconstructions"] = z.detach().cpu()
                 if sample:
                     pre_images["samples"] = samples.detach().cpu()
+                    
+                    # Extract depth and segmentation predictions from the last sampling step
+                    seva_model = self._get_seva_model(pl_module)
+                    if seva_model is not None:
+                        # Predictions should be available from the last forward pass in sampling
+                        # The last step has sigma ≈ 0, so predictions are on clean samples
+                        B, T = z.shape[:2]
+                        total_frames = B * T
+                        
+                        if seva_model.depth_pred is not None:
+                            depth_pred = seva_model.depth_pred.detach().cpu()  # [B*T, 1, 72, 72]
+                            
+                            # Upsample to RGB resolution
+                            depth_pred_rgb = F.interpolate(
+                                depth_pred,
+                                size=(576, 576),  # 72 * 8
+                                mode='bilinear',
+                                align_corners=False
+                            )
+                            
+                            # Visualize depth (already in [B*T, 3, 576, 576] format)
+                            depth_vis = self._visualize_depth(depth_pred_rgb)  # [B*T, 3, 576, 576]
+                            pre_images["depth_pred"] = depth_vis[:min(total_frames, self.max_images)]
+                        
+                        if seva_model.seg_pred is not None:
+                            seg_pred = seva_model.seg_pred.detach().cpu()  # [B*T, 28, 72, 72]
+                            
+                            seg_pred_rgb = F.interpolate(
+                                seg_pred,
+                                size=(576, 576),
+                                mode='nearest'
+                            )
+                            
+                            # Visualize segmentation (already in [B*T, 3, 576, 576] format)
+                            seg_vis = self._visualize_segmentation(seg_pred_rgb)  # [B*T, 3, 576, 576]
+                            pre_images["seg_pred"] = seg_vis[:min(total_frames, self.max_images)]
+                        
+                        # clear
+                        seva_model.depth_pred = None
+                        seva_model.seg_pred = None
+                    
+                    # Extract and visualize ground truth depth and segmentation
+                    if "sapiens_conditioning" in batch and batch["sapiens_conditioning"] is not None:
+                        sapiens_cond = batch["sapiens_conditioning"]
+                        
+                        # Ground truth depth
+                        if "depth" in sapiens_cond:
+                            gt_depth = sapiens_cond["depth"][:N].detach().cpu()  # [B, T, 1, 576, 576]
+                            B_gt, T_gt = gt_depth.shape[:2]
+                            total_frames_gt = B_gt * T_gt
+                            # Flatten to [B*T, 1, 576, 576] - skip channel dim in shape[2:] since we add it explicitly
+                            gt_depth_flat = gt_depth.view(B_gt * T_gt, *gt_depth.shape[2:])  # [B*T, 1, 576, 576]
+                            # Visualize GT depth
+                            depth_gt_vis = self._visualize_depth(gt_depth_flat)  # [B*T, 3, 576, 576]
+                            pre_images["depth_gt"] = depth_gt_vis[:min(total_frames_gt, self.max_images)]
+                        
+                        # Ground truth segmentation
+                        if "seg_masks" in sapiens_cond:
+                            gt_seg = sapiens_cond["seg_masks"][:N].detach().cpu()  # [B, T, C, 576, 576] or [B, T, 576, 576]
+                            B_gt, T_gt = gt_seg.shape[:2]
+                            total_frames_gt = B_gt * T_gt
+                            # Convert one-hot to class indices if needed
+                            if gt_seg.dim() == 5 and gt_seg.shape[2] > 1:
+                                # One-hot encoded: [B, T, C, H, W] -> [B, T, H, W]
+                                gt_seg_indices = gt_seg.argmax(dim=2)
+                            else:
+                                # Already class indices or single channel
+                                gt_seg_indices = gt_seg.squeeze(2) if gt_seg.dim() == 5 else gt_seg
+                            
+                            # Flatten to [B*T, H, W]
+                            gt_seg_flat = gt_seg_indices.view(B_gt * T_gt, *gt_seg_indices.shape[2:])
+                            # Convert to visualization format
+                            num_classes = 28
+                            # Normalize indices to [0, 1] for colormap
+                            gt_seg_norm = gt_seg_flat.float() / max(num_classes - 1, 1)
+                            gt_seg_norm_np = gt_seg_norm.cpu().numpy()
+                            cmap = cm.get_cmap('tab20')
+                            seg_gt_colored = cmap(gt_seg_norm_np)[..., :3]  # [B*T, H, W, 3]
+                            seg_gt_vis = torch.from_numpy(seg_gt_colored).float()
+                            seg_gt_vis = seg_gt_vis.permute(0, 3, 1, 2)  # [B*T, 3, H, W]
+                            pre_images["seg_gt"] = seg_gt_vis[:min(total_frames_gt, self.max_images)]
 
                 face_bbox = batch.get("face_bbox")
                 if face_bbox is not None:
