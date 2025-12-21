@@ -271,7 +271,7 @@ class Seva(nn.Module):
         if load_pretrained:
             from seva.utils import print_load_warning
             state_dict = load_seva_state_dict(params)
-            missing, unexpected = self.load_state_dict(state_dict, assign=True)
+            missing, unexpected = self.load_state_dict(state_dict, strict=False, assign=True)
             print_load_warning(missing, unexpected)
         
         if params.ckpt_path is not None:
