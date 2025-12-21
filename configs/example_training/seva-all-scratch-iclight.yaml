@@ -37,7 +37,6 @@ model:
         seva_model_config:
           target: seva.model.Seva
           params:
-            load_pretrained: false # IMPORTANT: Set to false to avoid loading base weights that don't have IP-Adapter layers
             params:
               in_channels: 16 # 16 + 5 (post projection: 4[seg_masks] + 1[depth] for concat; otherwise, leave as 16)
               model_channels: 320

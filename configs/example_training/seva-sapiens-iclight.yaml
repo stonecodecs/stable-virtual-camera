@@ -6,7 +6,8 @@ model:
     disable_first_stage_autocast: true
     input_key: clean_latent
     ### match this with MVHumanNetLoader!
-    use_sapiens_conditioning: [ "depth", "seg_masks" ]
+    concatenate_sapiens_conditioning: []  # Empty: no sapiens conditioning concatenation
+    sapiens_mask_loss_types: ["depth", "seg_masks"]  # Empty: no depth/segmentation loss
     ###
     network_wrapper: sgm.modules.diffusionmodules.wrappers.SevaWrapper
     scheduler_config:
@@ -37,7 +38,7 @@ model:
           target: seva.model.Seva
           params:
             params:
-              in_channels: 21 # 16 + 5 (post projection: 4[seg_masks] + 1[depth])
+              in_channels: 16  # Vanilla: no additional channels from sapiens conditioning
               model_channels: 320
               out_channels: 4
               num_frames: 8
@@ -51,12 +52,14 @@ model:
               dropout: 0.0
               unflatten_names: [ "middle_ds8", "output_ds4", "output_ds2" ]
               ckpt_path: null
-              use_ip_adapter: False  # Disabled: using only sapiens conditionings
+              use_ip_adapter: False  # Disabled: vanilla model without IP-Adapter
               face_context_dim: 512  # Not used when use_ip_adapter=False
               use_id_head: False
               ip_lambda_weight: 1.0
-        self_attn_rank: 256
-        cross_attn_rank: 512
+              depth_loss_weight: 0.15  # Disabled: no depth prediction head
+              seg_loss_weight: 0.05    # Disabled: no segmentation prediction head
+        self_attn_rank: 512
+        cross_attn_rank: 256
         alpha: 64.0
         dropout: 0.0
         target_modules:
@@ -65,8 +68,8 @@ model:
         - TransformerBlock
         keys_to_lora: [ q, k, v ]
         excluded_modules: []
-        ff_rank: 128
-        lora_for_face_attn_only: false  # Not using face attention, train all LoRA weights
+        ff_rank: 256
+        lora_for_face_attn_only: false  # Changed: train all LoRA weights (no face attention)
         freeze_lora: false
     conditioner_config:
       target: sgm.modules.GeneralConditioner
@@ -96,7 +99,7 @@ model:
           target: sgm.modules.encoders.modules.SevaFrozenOpenCLIPImageEmbedder
           params:
             unsqueeze_dim: true
-        # ArcFace embedder removed - not using IPAdapter/ArcFace, only sapiens conditionings
+        # ArcFace embedder removed - vanilla model without IP-Adapter
 
     first_stage_config:
       target: sgm.modules.encoders.modules.SevaAutoencoder
@@ -114,9 +117,9 @@ model:
             discretization_config:
               target: sgm.modules.diffusionmodules.discretizer.SevaDDPMDiscretization
         face_weighting: 0.0
-        arcface_loss_weight: 0.0  # Disabled: not using ArcFace
+        arcface_loss_weight: 0.0
         arcface_gt_key: "arcface_embedding"
-        background_downweight: 0.01
+        background_downweight: 0.05
     sampler_config:
       target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler
       params:
@@ -141,10 +144,11 @@ data:
     preload_path: /workspace/datasetvol/mvhuman_data/preload_paths/shards
     iclight_dataset_path: /workspace/datasetvol/mvhuman_data/relit_images
     infu_dataset_path: null
-    face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
+    # face_bbox_dir: /workspace/datasetvol/mvhuman_data/unified_face_boxes
     arcface_embeddings_dir: null  # Disabled: not using ArcFace embeddings
     ### match this with DiffusionEngine!
-    use_sapiens_conditioning: [ "depth", "seg_masks" ]
+    concatenate_sapiens_conditioning: []  # Empty: no sapiens conditioning concatenation
+    sapiens_mask_loss_types: ["depth", "seg_masks"]  # Empty: no depth/segmentation loss
     ###
     maximal_crop: true
     random_crop: true
@@ -185,3 +189,4 @@ lightning:
     max_epochs: 500
     precision: 16-mixed
     check_val_every_n_epoch: 1
+
