@@ -1,20 +1,24 @@
 import torch
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Optional, List
 from einops import repeat
 
 from seva.data.preprocessing import update_intrinsics, get_bbox_center_and_size
 
 # NOTE: this should be applied to the OUTPUT 576x576 image shape AFTER initial cropping!
 class RandomBBoxCropper(object):
-    def __init__(self, random_crop=True, random_crop_prob=1.0, crop_size_bounds=None, padding=[0,0,0,0]):
+    def __init__(self, random_crop=True, random_crop_prob=1.0, crop_size_bounds=None, padding=[0,0,0,0], face_crop_prob=0.5, face_bias_strength=0.7):
         """
         Random (Gaussian) crop transform centered around a 2D bounding box.
         NOTE: images are NOT resized to (576, 576) here!
         - padding: [left, top, right, bottom] (in pixels) only for deterministic crop!
+        - face_crop_prob: probability of biasing crop towards face region when face bbox is available
+        - face_bias_strength: strength of bias towards face (0.0 = no bias, 1.0 = fully centered on face)
         """
         self.crop_size_bounds = crop_size_bounds # (min_crop_size, max_crop_size)
         self.random_crop = random_crop # if maximal_crop only, then should be False
         self.random_crop_prob = random_crop_prob
+        self.face_crop_prob = face_crop_prob
+        self.face_bias_strength = face_bias_strength
         if not self.random_crop:
             self.random_crop_prob = 0.0
 
@@ -33,7 +37,8 @@ class RandomBBoxCropper(object):
         bbox: torch.Tensor, 
         K: torch.Tensor,
         options: dict,
-    ) -> Tuple[int, int, int, int, torch.Tensor]:
+        face_bboxes: Optional[torch.Tensor] = None,
+    ) -> dict:
         """
         Calculate crop parameters based on bbox and intrinsics.
         BBox is the initial "crop" onto the image, before random cropping (done here).
@@ -50,12 +55,15 @@ class RandomBBoxCropper(object):
                 - "center_std": 2D list of std values (x,y)_std
                 - "crop_size_mean": 1D list of mean values (crop_size)_mean
                 - "crop_size_std": 1D list of std values (crop_size)_std
+            face_bboxes: Tensor of shape (B, 4) with [x1, y1, x2, y2] for face regions
+                - [-1, -1, -1, -1] indicates no face detected
             NOTE: mean & std can be in normalized (0-1) or absolute (pixel) values.
             
         Returns:
-            (x1, y1, x2, y2): Crop coordinates (B, 4)
-            K_new: Updated intrinsics matrix (B, 3, 3)
-            rel_bbox: Relative bbox coordinates to inconsistent images
+            Dictionary containing:
+                - "bbox": Crop coordinates (B, 4)
+                - "K": Updated intrinsics matrix (B, 3, 3)
+                - "relative_bbox": Relative bbox coordinates to inconsistent images
         """
         W = options["W"]
         H = options["H"]
@@ -67,71 +75,136 @@ class RandomBBoxCropper(object):
         center_x, center_y = centers.T
         bbox_W, bbox_H = sizes.T
 
-        # deterministic crop
-        bbox_max_dim = torch.maximum(bbox_W, bbox_H) # (B,)
+        # Define canonical (body-centered) boundaries first
+        bbox_max_dim_can = torch.maximum(bbox_W, bbox_H) # (B,) max dimension from raw bbox
+        total_size_can = (bbox_max_dim_can + self.padding[0] + self.padding[2]).int() # canoncial size (synthetic square)
+        x1_can = torch.floor(center_x - (bbox_max_dim_can // 2) - self.padding[0]).int()
+        y1_can = torch.ceil(center_y - (bbox_max_dim_can // 2) - self.padding[1]).int()
+        x2_can = x1_can + total_size_can
+        y2_can = y1_can + total_size_can
+
+        # Check if we should bias towards face regions
+        if face_bboxes is not None:
+            use_face_bias = torch.rand(B) < self.face_crop_prob
+        else:
+            use_face_bias = torch.zeros(B, dtype=torch.bool)
         
+        # If face bboxes are provided and valid, bias the base centers towards them
+        bbox_max_dim = bbox_max_dim_can.clone()
+        if face_bboxes is not None:
+            # Identify valid face bboxes (false for no-face indicator: [-1, -1, -1, -1])
+            valid_faces = face_bboxes[:, 0] != -1
+            apply_face_bias = use_face_bias & valid_faces
+            
+            if apply_face_bias.any():
+                # Calculate face centers for valid faces
+                face_center_x = (face_bboxes[:, 0] + face_bboxes[:, 2]) / 2.0
+                face_center_y = (face_bboxes[:, 1] + face_bboxes[:, 3]) / 2.0
+                
+                # Blend between body center and face center based on bias strength
+                center_x[apply_face_bias] = (
+                    (1 - self.face_bias_strength) * center_x[apply_face_bias] + 
+                    self.face_bias_strength * face_center_x[apply_face_bias]
+                )
+                center_y[apply_face_bias] = (
+                    (1 - self.face_bias_strength) * center_y[apply_face_bias] + 
+                    self.face_bias_strength * face_center_y[apply_face_bias]
+                )
+
+                # Zoom in more if we are gravitating towards a face (hardcoded a empirically good value)
+                bbox_max_dim[apply_face_bias] = bbox_max_dim[apply_face_bias] * (0.30 + (torch.rand(B, device=bbox.device)[apply_face_bias] * 2 - 1) * 0.20)
+                # Ensure zoomed bbox is not larger than canonical
+                bbox_max_dim[apply_face_bias] = torch.clamp(bbox_max_dim[apply_face_bias], max=total_size_can[apply_face_bias])
+
+        # 'Current' total size (potentially face-biased)
+        total_size = (bbox_max_dim + self.padding[0] + self.padding[2]).int()
+
+        # Calculate coordinates and clamp them to stay within the canonical square
         x1 = torch.floor(center_x - (bbox_max_dim // 2) - self.padding[0]).int()
         y1 = torch.ceil(center_y - (bbox_max_dim // 2) - self.padding[1]).int()
         
-        total_width = bbox_max_dim + self.padding[0] + self.padding[2]
-        total_height = bbox_max_dim + self.padding[1] + self.padding[3]
+        x1 = torch.clamp(x1, min=x1_can, max=x2_can - total_size)
+        y1 = torch.clamp(y1, min=y1_can, max=y2_can - total_size)
         
-        x2 = x1 + total_width
-        y2 = y1 + total_height
+        x2 = x1 + total_size
+        y2 = y1 + total_size
         
+        # Update centers for random crop logic to be centered on the deterministic crop
+        centers = torch.stack([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dim=1)
+        
+        # rel_bbox will store the total delta from canonical crop to final crop
         rel_bbox = torch.zeros(B, 4)
 
-        if self.random_crop and options.get("to_crop", False):
-            center_mean    = options.get("center_mean", centers)
-            center_std     = options.get("center_std", torch.stack([(W - bbox_W) / 6, (H - bbox_H) / 6], dim=1))
-            crop_size_mean = options.get("crop_size_mean", (bbox_W + bbox_H) * 3 / 4)
-            crop_size_std  = options.get("crop_size_std", (bbox_W + bbox_H) / 2)
-            min_crop_size  = options.get("min_crop_size", (bbox_max_dim * 3) // 4)
+        # NOTE: when face crops are applied, we do NOT apply the random crop!
+        to_random_crop = options.get("to_crop", False)
+        if self.random_crop and to_random_crop:
+            # Identify indices that are NOT face-biased
+            random_indices = ~use_face_bias # if no face_bbox, all True
+            
+            if random_indices.any():
+                center_mean    = options.get("center_mean", centers)
+                center_std     = options.get("center_std", torch.stack([(W - bbox_W) / 6, (H - bbox_H) / 6], dim=1))
+                crop_size_mean = options.get("crop_size_mean", (bbox_W + bbox_H) * 3 / 4)
+                crop_size_std  = options.get("crop_size_std", (bbox_W + bbox_H) / 2)
+                min_crop_size  = options.get("min_crop_size", (bbox_max_dim * 3) // 4)
 
-            center_mean    = percent_to_absolute(center_mean, torch.tensor([H, W]))
-            center_std     = torch.as_tensor(center_std)
-            crop_size_mean = percent_to_absolute(crop_size_mean, torch.tensor([min(H, W)]))
-            crop_size_std  = torch.as_tensor(crop_size_std)
+                center_mean    = percent_to_absolute(center_mean, torch.tensor([H, W]))
+                center_std     = torch.as_tensor(center_std)
+                crop_size_mean = percent_to_absolute(crop_size_mean, torch.tensor([min(H, W)]))
+                crop_size_std  = torch.as_tensor(crop_size_std)
 
-            size_sample = torch.clamp(torch.randn(B) * crop_size_std + crop_size_mean, min=min_crop_size, max=bbox_max_dim)
+                size_sample = torch.clamp(torch.randn(B) * crop_size_std + crop_size_mean, min=min_crop_size, max=bbox_max_dim)
 
-            if self.crop_size_bounds is not None:
-                size_sample = torch.clamp(
-                    size_sample,
-                    min=percent_to_absolute(self.crop_size_bounds[0], torch.tensor([min(H, W)])),
-                    max=percent_to_absolute(self.crop_size_bounds[1], torch.tensor([min(H, W)]))
+                if self.crop_size_bounds is not None:
+                    size_sample = torch.clamp(
+                        size_sample,
+                        min=percent_to_absolute(self.crop_size_bounds[0], torch.tensor([min(H, W)])),
+                        max=percent_to_absolute(self.crop_size_bounds[1], torch.tensor([min(H, W)]))
+                    )
+
+                size_sample_int = size_sample.int()
+
+                x_offset = torch.clamp(
+                    torch.randn(B,1) * center_std[:,0].view(-1,1) + center_mean[:,0].view(-1,1),
+                    min=(x1 + size_sample_int // 2).view(-1, 1),
+                    max=(x2 - size_sample_int // 2).view(-1, 1)
+                )
+                y_offset = torch.clamp(
+                    torch.randn(B,1) * center_std[:,1].view(-1,1) + center_mean[:,1].view(-1,1),
+                    min=(y1 + size_sample_int // 2).view(-1, 1),
+                    max=(y2 - size_sample_int // 2).view(-1, 1)
                 )
 
-            size_sample_int = size_sample.int()
+                # random crop coordinates
+                x1_new = torch.floor(x_offset - (size_sample_int // 2).view(-1, 1)).int().view(-1)
+                y1_new = torch.floor(y_offset - (size_sample_int // 2).view(-1, 1)).int().view(-1)
+                x2_new = x1_new + size_sample_int.view(-1)
+                y2_new = y1_new + size_sample_int.view(-1)
 
-            x_offset = torch.clamp(
-                torch.randn(B,1) * center_std[:,0].view(-1,1) + center_mean[:,0].view(-1,1),
-                min=(x1 + size_sample_int // 2).view(-1, 1),
-                max=(x2 - size_sample_int // 2).view(-1, 1)
-            )
-            y_offset = torch.clamp(
-                # ! -200 is HARDCODED to get the face
-                torch.randn(B,1) * center_std[:,1].view(-1,1) + center_mean[:,1].view(-1,1) - 200,
-                min=(y1 + size_sample_int // 2).view(-1, 1),
-                max=(y2 - size_sample_int // 2).view(-1, 1)
-            )
+                # ONLY apply the new coordinates to non-face-biased indices
+                x1[random_indices] = x1_new[random_indices]
+                y1[random_indices] = y1_new[random_indices]
+                x2[random_indices] = x2_new[random_indices]
+                y2[random_indices] = y2_new[random_indices]
 
-            # random crop
-            x1_new = torch.floor(x_offset - (size_sample_int // 2).view(-1, 1)).int().view(-1)
-            y1_new = torch.floor(y_offset - (size_sample_int // 2).view(-1, 1)).int().view(-1)
-            
-            # guarantee (x2_new - x1_new) == size_sample_int
-            x2_new = x1_new + size_sample_int.view(-1)
-            y2_new = y1_new + size_sample_int.view(-1)
-
-            rel_bbox[:, 0] = x1_new - x1
-            rel_bbox[:, 1] = y1_new - y1
-            rel_bbox[:, 2] = x2_new - x2
-            rel_bbox[:, 3] = y2_new - y2
-            x1, y1, x2, y2 = x1_new, y1_new, x2_new, y2_new
+            # Store deltas relative to canonical boundaries [dx1, dy1, dx2, dy2]
+            # dx1, dy1: shift from top-left (positive)
+            # dx2, dy2: shift from bottom-right (negative)
+            rel_bbox[:, 0] = x1 - x1_can
+            rel_bbox[:, 1] = y1 - y1_can
+            rel_bbox[:, 2] = x2 - x2_can
+            rel_bbox[:, 3] = y2 - y2_can
+        else:
+            # Absolute coordinates relative to canonical square
+            rel_bbox[:, 0] = x1 - x1_can
+            rel_bbox[:, 1] = y1 - y1_can
+            rel_bbox[:, 2] = x2 - x2_can
+            rel_bbox[:, 3] = y2 - y2_can
 
         if len(K.shape) == 2:
             K_ = repeat(K, 'd1 d2 -> n d1 d2', n=B).detach().clone()
+        else:
+            K_ = K.detach().clone()
 
         K_new = update_intrinsics(
             torch.as_tensor(K_), 
@@ -142,7 +215,8 @@ class RandomBBoxCropper(object):
             padding_mode=True
         )
 
-        scale = 576.0 / (bbox_max_dim + self.padding[0] + self.padding[2])
+        # Scale rel_bbox relative to the canonical size (mapped to 576)
+        scale = 576.0 / total_size_can # accounts for padding
         rel_bbox = (rel_bbox * scale.view(-1, 1)).int()
 
         return {
@@ -193,6 +267,8 @@ class RandomBBoxCropper(object):
         Crop images based on bounding box.
         """
         cropped_images = []
+        if isinstance(images, torch.Tensor):
+            images = [images[i] for i in range(images.shape[0])]
         for i in range(len(images)):
             if len(images[i].shape) == 2:
                 cropped_img = images[i][int(y1[i]):int(y2[i]), int(x1[i]):int(x2[i])]
@@ -206,9 +282,9 @@ class RandomBBoxCropper(object):
         images: torch.Tensor, 
         bbox: torch.Tensor, 
         K: torch.Tensor,
-        face_bboxes: torch.Tensor = None,
+        face_bboxes: Optional[torch.Tensor] = None,
         **kwargs
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[list, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         Args:
             images: Tensor of shape (B, C, H, W)
@@ -230,8 +306,8 @@ class RandomBBoxCropper(object):
         }
         options.update(kwargs) # bias towards face based on "annots" face box!
 
-        # get new crop parameters
-        crop_params = self._get_crop_params(bbox, K, options) # * GOOD
+        # get new crop parameters (pass face_bboxes for potential face-biased cropping)
+        crop_params = self._get_crop_params(bbox, K, options, face_bboxes=face_bboxes) # * GOOD
         bbox = crop_params["bbox"]
         K_new = crop_params["K"]
         rel_bbox = crop_params["relative_bbox"] # for cropping ic images (scaled to 576^2)
@@ -243,6 +319,7 @@ class RandomBBoxCropper(object):
         images, bbox = self._possibly_pad_img(images, x1, y1, x2, y2)
         x1, y1, x2, y2 = bbox.T
 
+        face_bboxes_new = None
         if face_bboxes is not None:
             # reposition face wrt new corner point
             # scale this to target shape INTERNALLY (here)!

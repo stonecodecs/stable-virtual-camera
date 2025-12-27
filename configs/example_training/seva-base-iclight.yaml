@@ -152,9 +152,12 @@ data:
     ###
     maximal_crop: true
     random_crop: true
+    random_crop_prob: 0.3  # Probability of applying random crop
     use_inconsistent: true
     ic_sampling_prob: 0.5
     fixed_sampling_ids: null
+    face_crop_prob: 0.5  # Probability of biasing crop towards face when face bbox available
+    face_bias_strength: 0.7  # Strength of face bias (0.0=no bias, 1.0=fully centered on face)
     exclude:
     - '102206'
     - '102207'

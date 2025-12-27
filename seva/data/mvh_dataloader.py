@@ -182,7 +182,8 @@ class MVHumanNetDataset(Dataset):
         concatenate_sapiens_conditioning=None, # list of "depth, seg, latents" later
         sapiens_mask_loss_types=[], # list of "depth, seg, latents" later (for loss)
         sapiens_segmentation_channels_to_use=[], # face
-        force_face_ref=False # if True, then will force the reference frame to be a face frame
+        face_crop_prob=0.5, # probability of biasing crop towards face when face bbox available
+        face_bias_strength=0.7, # strength of face bias (0.0=no bias, 1.0=fully centered on face)
     ):
         self.root_dir = root_dir             # directory of all subject directories
         self.latents_dir = latents_dir       # directory of all latents
@@ -219,7 +220,8 @@ class MVHumanNetDataset(Dataset):
         self.infu_dataset_path = infu_dataset_path # InfU output directory
         self.face_bbox_dir = face_bbox_dir # Face bounding box directory
         self.arcface_embeddings_dir = arcface_embeddings_dir # ArcFace embeddings directory
-        self.force_face_ref = force_face_ref
+        self.face_crop_prob = face_crop_prob
+        self.face_bias_strength = face_bias_strength
         # NOTE: currently we only have arcface_embeddings for MVHN gt dataset
     
         # if not None, will use the "phase 2" expected training process
@@ -284,7 +286,9 @@ class MVHumanNetDataset(Dataset):
             self.cropper = RandomBBoxCropper(
                 random_crop=self.random_crop,
                 random_crop_prob=self.random_crop_prob,
-                padding=self.crop_padding
+                padding=self.crop_padding,
+                face_crop_prob=self.face_crop_prob,
+                face_bias_strength=self.face_bias_strength
             )
             self.transform = T.Compose([
                 T.Resize(self.target_shape),
@@ -859,17 +863,26 @@ class MVHumanNetDataset(Dataset):
             annots_jsons = [frames_info[cam]["annots"] for cam in cam_order]
             crop_params = []
             face_bboxes_adjusted = []
+            faces_present_mask = []
             for annots_json in annots_jsons:
                 bbox = annots_json['bbox'][:4]
-                face_bbox = annots_json['bbox_face'][:4] if self.face_bboxes is not None else [-1, -1, -1, -1] # this is from facebbox dir
+                if self.face_bboxes is not None and annots_json.get('bbox_face') is not None:
+                    face_bbox = annots_json['bbox_face'][:4]
+                    faces_present_mask.append(True if face_bbox != [-1, -1, -1, -1] else False)
+                    face_bboxes_adjusted.append(face_bbox)
                 crop_params.append(bbox)
-                face_bboxes_adjusted.append(face_bbox)
             # account for mvhn downsampling (hence the 0.5)
             # ! big HACK: after 103000+, the annotations are not scaled by 0.5 anymore!
             bbox_annot_scale = 0.5 if int(subject_id) < 103000 else 1.0
             bbox_params = torch.stack([torch.tensor(bbox) * bbox_annot_scale for bbox in crop_params])
-
-            face_params = torch.stack([torch.tensor(face_bbox) * bbox_annot_scale for face_bbox in face_bboxes_adjusted])
+            face_params = []
+            for face_bbox, is_face in zip(face_bboxes_adjusted, faces_present_mask):
+                face_bbox = torch.tensor(face_bbox)
+                if is_face: 
+                    face_bbox = face_bbox * bbox_annot_scale
+                face_params.append(face_bbox)
+                
+            face_params = torch.stack(face_params) if len(face_params) > 0 else None
             frames, Ks, rel_bbox, face_bboxes_result, new_bbox, bbox_before_pad = self.cropper(frames, bbox_params, torch.from_numpy(intrinsics).float(), face_bboxes=face_params)
             # ! this is bugged; ensure that padding is correctly done 
             image_masks, _ = self.cropper._possibly_pad_img(image_masks.unsqueeze(1), bbox_before_pad[:,0], bbox_before_pad[:,1], bbox_before_pad[:,2], bbox_before_pad[:,3])
@@ -940,10 +953,10 @@ class MVHumanNetDataset(Dataset):
                 ic_rgb_tensor[i] = ic_image_
 
                 # same for the sapiens conditionings
-                if self.concatenate_sapiens_conditioning is not None or len(self.sapiens_mask_loss_types) > 0:
+                if (self.concatenate_sapiens_conditioning is not None and len(self.concatenate_sapiens_conditioning) > 0) or len(self.sapiens_mask_loss_types) > 0:
                     # only the ref images are cropped in this way   
                     ref_idx = torch.where(ref_mask == True)[0][0].item()
-                    types = self.concatenate_sapiens_conditioning if len(self.concatenate_sapiens_conditioning) > 0 else self.sapiens_mask_loss_types
+                    types = self.concatenate_sapiens_conditioning if (self.concatenate_sapiens_conditioning is not None and len(self.concatenate_sapiens_conditioning) > 0) else self.sapiens_mask_loss_types
                     for cond in types:
                         cond_tensor = sapiens_conditionings[cond][i]
                         if ref_idx == i:
@@ -980,8 +993,8 @@ class MVHumanNetDataset(Dataset):
             image_masks = torch.stack(image_masks, dim=0)
 
             # frames = torch.stack(frames, dim=0) # resize to 576x576 normalized [-1, 1] image tensors
-            if self.concatenate_sapiens_conditioning is not None or len(self.concatenate_sapiens_conditioning) > 0:
-                types = self.concatenate_sapiens_conditioning if len(self.concatenate_sapiens_conditioning) > 0 else self.sapiens_mask_loss_types
+            if self.concatenate_sapiens_conditioning is not None or len(self.sapiens_mask_loss_types) > 0:
+                types = self.concatenate_sapiens_conditioning if (self.concatenate_sapiens_conditioning is not None and len(self.concatenate_sapiens_conditioning) > 0) else self.sapiens_mask_loss_types
                 for cond in types:
                     for is_ref, cond_tensor in zip(ref_mask, sapiens_conditionings[cond]):
                         cond_tensor = T.Resize((self.target_shape[0], self.target_shape[1]))(cond_tensor) # both follows this old behavior
@@ -1037,8 +1050,8 @@ class MVHumanNetDataset(Dataset):
         """
          # get sapiens conditionings; NOTE: these are of original image size (need to crop later)
         sapiens_conditionings = {}
-        if self.concatenate_sapiens_conditioning is not None or len(self.sapiens_mask_loss_types) > 0:
-            types = self.concatenate_sapiens_conditioning if len(self.concatenate_sapiens_conditioning) > 0 else self.sapiens_mask_loss_types
+        if self.concatenate_sapiens_conditioning is not None and len(self.concatenate_sapiens_conditioning) > 0 or len(self.sapiens_mask_loss_types) > 0:
+            types = self.concatenate_sapiens_conditioning if (self.concatenate_sapiens_conditioning is not None and len(self.concatenate_sapiens_conditioning) > 0) else self.sapiens_mask_loss_types
             for cond in types:
                 sapiens_conditionings[cond] = []
                 for is_ref, is_iclight, is_infu, camera, ic_path in zip(ref_mask, ic_masks['iclight'], ic_masks['infu'], cam_order, ic_paths):
@@ -1118,7 +1131,8 @@ class MVHumanNetDataset(Dataset):
                     bbox_face = [-1,-1,-1,-1]
                     if camera in annots_bbox_face and time_id in annots_bbox_face[camera]:
                         bbox_face = annots_bbox_face[camera][time_id]
-                        
+                        if bbox_face[:4] == [0.0,0.0,100.0,100.0]:
+                            bbox_face = [-1,-1,-1,-1]
                     # Validate bbox (same check as in JSON loader)
                     if (bbox[2] - bbox[0]) == 0 or (bbox[3] - bbox[1]) == 0:
                         continue
@@ -1371,6 +1385,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
         concatenate_sapiens_conditioning: list = None,
         sapiens_segmentation_channels_to_use: list = None,
         sapiens_mask_loss_types: list = None,
+        face_crop_prob: float = 0.5,
+        face_bias_strength: float = 0.7,
     ):
         super().__init__()
         print("init of DATALOADER")
@@ -1399,6 +1415,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
         self.concatenate_sapiens_conditioning = concatenate_sapiens_conditioning
         self.sapiens_segmentation_channels_to_use = sapiens_segmentation_channels_to_use
         self.sapiens_mask_loss_types = sapiens_mask_loss_types if sapiens_mask_loss_types is not None else []
+        self.face_crop_prob = face_crop_prob
+        self.face_bias_strength = face_bias_strength
         # Define transforms
         # self.transform = T.Compose([
         #     T.Resize(image_size), # whatever final resolution we want here
@@ -1452,6 +1470,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 concatenate_sapiens_conditioning=self.concatenate_sapiens_conditioning,
                 sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
                 sapiens_mask_loss_types=self.sapiens_mask_loss_types,
+                face_crop_prob=self.face_crop_prob,
+                face_bias_strength=self.face_bias_strength,
             )
 
         if stage == "validate" or stage is None:
@@ -1479,6 +1499,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 concatenate_sapiens_conditioning=self.concatenate_sapiens_conditioning,
                 sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
                 sapiens_mask_loss_types=self.sapiens_mask_loss_types,
+                face_crop_prob=self.face_crop_prob,
+                face_bias_strength=self.face_bias_strength,
             )
         if stage == "test" or stage is None:
             self.test_dataset = MVHumanNetDataset(
@@ -1504,6 +1526,8 @@ class MVHumanNetLoader(pl.LightningDataModule):
                 concatenate_sapiens_conditioning=self.concatenate_sapiens_conditioning,
                 sapiens_segmentation_channels_to_use=self.sapiens_segmentation_channels_to_use,
                 sapiens_mask_loss_types=self.sapiens_mask_loss_types,
+                face_crop_prob=self.face_crop_prob,
+                face_bias_strength=self.face_bias_strength,
             )
             
     def prepare_data(self):
