@@ -717,8 +717,15 @@ class ImageLogger(Callback):
         # pl_module: Union[None, pl.LightningModule] = None,
     ):
         root = os.path.join(save_dir, "images", split)
-        ref_mask   = masks[0].reshape(-1)
-        input_mask = masks[1].reshape(-1)
+        
+        # Ensure masks are tensors and have consistent shape
+        def ensure_tensor_mask(m):
+            if isinstance(m, list):
+                return torch.stack([torch.as_tensor(x) for x in m])
+            return torch.as_tensor(m)
+
+        ref_mask   = ensure_tensor_mask(masks[0]).reshape(-1)
+        input_mask = ensure_tensor_mask(masks[1]).reshape(-1)
         components_for_diffmap = []
         for k in images:
             if isheatmap(images[k]):
@@ -1137,6 +1144,8 @@ class ImageLogger(Callback):
 
                 face_bbox = batch.get("face_bbox")
                 if face_bbox is not None:
+                    if isinstance(face_bbox, list):
+                        face_bbox = torch.stack([torch.as_tensor(fb) for fb in face_bbox])
                     face_bbox = face_bbox[:N].reshape(-1, 4).detach().cpu()
 
                 # flatten for decoder
@@ -1166,8 +1175,17 @@ class ImageLogger(Callback):
 
                 masks = []
                 # masks = batch["mask"] # (B, max_images) binary boolean tensor
-                masks.append(batch["ref_mask"][:N].detach().cpu()) # (B, max_images) binary boolean tensor
-                masks.append(batch["mask"][:N].detach().cpu()) # (B, max_images) binary boolean tensor
+                
+                ref_mask_batch = batch["ref_mask"][:N]
+                input_mask_batch = batch["mask"][:N]
+                
+                if isinstance(ref_mask_batch, list):
+                    ref_mask_batch = torch.stack([torch.as_tensor(m) for m in ref_mask_batch])
+                if isinstance(input_mask_batch, list):
+                    input_mask_batch = torch.stack([torch.as_tensor(m) for m in input_mask_batch])
+
+                masks.append(ref_mask_batch.detach().cpu()) # (B, max_images) binary boolean tensor
+                masks.append(input_mask_batch.detach().cpu()) # (B, max_images) binary boolean tensor
 
                 if is_train: # if was training previously, set it back
                     # this shouldn't interfere, since the VAE is frozen anyways

@@ -308,6 +308,8 @@ class StandardDiffusionLoss(nn.Module):
         # add face weighting if face_weighting > 0.0
         additional_loss = torch.tensor(0.0, device=model_output.device, dtype=model_output.dtype)
         if loss_mask is not None:
+            if isinstance(loss_mask, list):
+                loss_mask = torch.stack([torch.as_tensor(lm) for lm in loss_mask])
             assert loss_mask.shape[0] == model_output.shape[0], f"Loss mask batch size mismatch. Got {loss_mask.shape[0]} but expected {model_output.shape[0]}."
             # use F.interpolate to resize the loss mask to the latent spatial dimensions
             # HACK: hardcoded 8x downsampling
@@ -322,6 +324,10 @@ class StandardDiffusionLoss(nn.Module):
                 spatial_loss.reshape(target.shape[0], -1), 1
             )
             if enable_face_weighting and face_bbox is not None and len(face_bbox) > 0 and ref_mask is not None:
+                if isinstance(face_bbox, list):
+                    face_bbox = torch.stack([torch.as_tensor(fb) for fb in face_bbox])
+                if isinstance(ref_mask, list):
+                    ref_mask = torch.stack([torch.as_tensor(rm) for rm in ref_mask])
                 additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss, ref_mask)
                 loss = loss + additional_loss
             return loss
@@ -331,12 +337,20 @@ class StandardDiffusionLoss(nn.Module):
                 spatial_loss.reshape(target.shape[0], -1), 1
             )
             if enable_face_weighting and face_bbox is not None and len(face_bbox) > 0 and ref_mask is not None:
+                if isinstance(face_bbox, list):
+                    face_bbox = torch.stack([torch.as_tensor(fb) for fb in face_bbox])
+                if isinstance(ref_mask, list):
+                    ref_mask = torch.stack([torch.as_tensor(rm) for rm in ref_mask])
                 additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss, ref_mask)
                 loss = loss + additional_loss
             return loss
         elif self.loss_type == "lpips": # only really usable in RGB space
             loss = self.lpips(model_output, target).reshape(-1)
             if enable_face_weighting and face_bbox is not None and len(face_bbox) > 0 and ref_mask is not None:
+                if isinstance(face_bbox, list):
+                    face_bbox = torch.stack([torch.as_tensor(fb) for fb in face_bbox])
+                if isinstance(ref_mask, list):
+                    ref_mask = torch.stack([torch.as_tensor(rm) for rm in ref_mask])
                 additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, loss, ref_mask)
                 loss = loss + additional_loss
             return loss
@@ -368,8 +382,15 @@ class StandardDiffusionLoss(nn.Module):
         B, T, C, H, W = model_output.shape # H, W are latent dim 72x72 spatial dims
 
         # cropped model output (assuming that face output is in the same position)
-        face_bboxes_flat = batch["face_bbox"].reshape(B * T, 4)
-        ref_mask_flat = batch["ref_mask"].reshape(B * T)  # Flatten ref_mask to match
+        face_bbox = batch["face_bbox"]
+        if isinstance(face_bbox, list):
+            face_bbox = torch.stack([torch.as_tensor(fb) for fb in face_bbox])
+        face_bboxes_flat = face_bbox.reshape(B * T, 4)
+        
+        ref_mask = batch["ref_mask"]
+        if isinstance(ref_mask, list):
+            ref_mask = torch.stack([torch.as_tensor(m) for m in ref_mask])
+        ref_mask_flat = ref_mask.reshape(B * T)  # Flatten ref_mask to match
         model_output = model_output.reshape(B * T, C, H, W)
         rgb_gt = batch["frames"].reshape(B * T, 3, H * 8, W * 8) # these are 576^2
         
@@ -473,7 +494,11 @@ class StandardDiffusionLoss(nn.Module):
         if depth_pred is None:
             return torch.tensor(0.0, device=device, dtype=dtype)
 
-        B, T = batch['mask'].shape[:2]
+        mask = batch['mask']
+        if isinstance(mask, list):
+            mask = torch.stack([torch.as_tensor(mi) for mi in mask])
+        B, T = mask.shape[:2]
+        
         depth_pred = depth_pred.reshape(B, T, *depth_pred.shape[-3:])
 
         sapiens_conditioning = batch.get("sapiens_conditioning")
@@ -481,6 +506,9 @@ class StandardDiffusionLoss(nn.Module):
             return torch.tensor(0.0, device=device, dtype=dtype)
         
         gt_depth = sapiens_conditioning["depth"]
+        if isinstance(gt_depth, list):
+            gt_depth = torch.stack([torch.as_tensor(gi) for gi in gt_depth])
+            
         # resize gt_depth to depth_pred spatially
         gt_depth_resized = F.interpolate(
             gt_depth.view(B * T, *gt_depth.shape[2:]),
@@ -513,6 +541,9 @@ class StandardDiffusionLoss(nn.Module):
             return torch.tensor(0.0, device=device, dtype=dtype)
 
         gt_seg = sapiens_conditioning["seg_masks"]
+        if isinstance(gt_seg, list):
+            gt_seg = torch.stack([torch.as_tensor(gi) for gi in gt_seg])
+            
         # Convert one-hot to class indices for cross-entropy
         # gt_seg is one-hot: [B, T, C, H, W] -> class indices: [B, T, H, W]
         if gt_seg.shape[2] > 1:  # One-hot encoded
@@ -520,7 +551,11 @@ class StandardDiffusionLoss(nn.Module):
         else:
             gt_seg_indices = gt_seg.squeeze(2)  # [B, T, H, W]
     
-        B, T = batch['mask'].shape[:2]
+        mask = batch['mask']
+        if isinstance(mask, list):
+            mask = torch.stack([torch.as_tensor(mi) for mi in mask])
+        B, T = mask.shape[:2]
+        
         seg_pred = seg_pred.reshape(B, T, *seg_pred.shape[-3:])  # [B, T, C, H, W]
         # seg_pred should remain as logits [B, T, C, H, W] for cross-entropy loss
         

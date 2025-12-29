@@ -401,6 +401,8 @@ class DiffusionEngine(pl.LightningModule):
         x = self.get_input(batch)
         if len(x.shape) == 1: # scalar indicates latents are NOT computed yet (=> on the fly)
             x = batch["frames"].to(self.device)
+            if isinstance(x, list):
+                x = torch.stack([torch.as_tensor(xi) for xi in x])
             batch_latents = []
             for b in x:
                 batch_latents.append(self.encode_first_stage(b))

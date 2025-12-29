@@ -1002,6 +1002,13 @@ class MVHumanNetDataset(Dataset):
                             cond_tensor = one_hot_encode_segmentation(cond_tensor, 28)
             sapiens_conditionings = {cond: torch.stack(cond_tensor, dim=0) for cond, cond_tensor in sapiens_conditionings.items()}
 
+        if face_bboxes_adjusted is not None:
+            if not isinstance(face_bboxes_adjusted, torch.Tensor):
+                face_bboxes_adjusted = torch.tensor(face_bboxes_adjusted)
+        else:
+            # Provide a dummy tensor if no face bboxes are available to keep batch structure consistent
+            face_bboxes_adjusted = torch.full((self.num_images, 4), -1, dtype=torch.int32)
+
         return frames, image_masks, ic_rgb, Ks, sapiens_conditionings, face_bboxes_adjusted
 
     def _get_arcface_embeddings(self, subject_id, timestep, cam_order, input_target_mask, ref_mask, ic_masks):
