@@ -2,6 +2,8 @@ import os
 import json
 import pickle
 import glob
+import traceback
+import sys
 from collections import defaultdict
 from einops import rearrange, repeat 
 from tqdm import tqdm
@@ -104,6 +106,9 @@ def scale_cameras(c2ws, camera_scale=2.0):
 
 
 def read_from_hdf5(hdf5_file, *args):
+    """
+    Read data from HDF5 file.
+    """
     # each arg will be nested keys
     try:
         with h5py.File(hdf5_file, 'r') as f:
@@ -660,10 +665,12 @@ class MVHumanNetDataset(Dataset):
                 npz_path = os.path.join(self.iclight_dataset_path, subject_id, f"{subject_id}_{cond}.npz")
             else:
                 raise ValueError(f"Invalid dataset type: {dataset_type}")
-            data = np.load(npz_path)
-            # if INFU, timestep is the given sample ID instead!
-            query = timestep if dataset_type == "infu" else f"{camera}_{timestep}"
-            return torch.tensor(data[query])
+            # Use context manager to properly close file handles and prevent leaks
+            with np.load(npz_path) as data:
+                # if INFU, timestep is the given sample ID instead!
+                query = timestep if dataset_type == "infu" else f"{camera}_{timestep}"
+                # Copy data before context manager closes the file
+                return torch.tensor(np.array(data[query], copy=True))
         except Exception as e:
             print(f"Error loading sapiens conditioning: {e}")
             return None
@@ -693,7 +700,7 @@ class MVHumanNetDataset(Dataset):
             masked_image = Image.composite(image, background, img_mask)
             frames[i] = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])(masked_image)
             img_masks[i] = T.Compose([T.ToImage()])(img_mask)
-            del image, img_mask, masked_image # free PIL images
+            del image, img_mask, masked_image, background  # free PIL images
         return frames, img_masks
 
     def _sample_multiview_image_paths(self, frames_info: dict, use_iclight: bool = False, use_infu: bool = False) -> Tuple[list[str], list[str], list[str], Union[list[int], np.ndarray]]:
@@ -845,6 +852,7 @@ class MVHumanNetDataset(Dataset):
             if ic_path is not None:
                 ic_image = Image.open(ic_path).convert("RGB")
                 ic_rgb.append(tensorize(ic_image)) # these can be different image shapes originally
+                del ic_image  # free PIL image to prevent memory leak
             else: # if not, then just send the 0 tensor
                 ic_rgb.append(torch.zeros((3, self.target_shape[0], self.target_shape[1]), dtype=torch.float32))
         return ic_rgb, ic_paths
@@ -1097,7 +1105,11 @@ class MVHumanNetDataset(Dataset):
         try:
             return self.create_batch(idx)
         except Exception as e:
-            print(f"Error creating batch at index {idx}: {e}. Skipping this scene.")
+            print(f"Error creating batch at index {idx}: {e}")
+            print(f"Traceback:\n{traceback.format_exc()}")
+            # Force flush to ensure error is visible before potential segfault
+            sys.stdout.flush()
+            sys.stderr.flush()
             return None
     
     def create_batch(self, idx):
