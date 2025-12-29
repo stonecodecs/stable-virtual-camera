@@ -321,7 +321,7 @@ class StandardDiffusionLoss(nn.Module):
             loss = torch.mean(
                 spatial_loss.reshape(target.shape[0], -1), 1
             )
-            if enable_face_weighting and face_bbox is not None and ref_mask is not None:
+            if enable_face_weighting and face_bbox is not None and len(face_bbox) > 0 and ref_mask is not None:
                 additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss, ref_mask)
                 loss = loss + additional_loss
             return loss
@@ -330,13 +330,13 @@ class StandardDiffusionLoss(nn.Module):
             loss = torch.mean(
                 spatial_loss.reshape(target.shape[0], -1), 1
             )
-            if enable_face_weighting and face_bbox is not None and ref_mask is not None:
+            if enable_face_weighting and face_bbox is not None and len(face_bbox) > 0 and ref_mask is not None:
                 additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, spatial_loss, ref_mask)
                 loss = loss + additional_loss
             return loss
         elif self.loss_type == "lpips": # only really usable in RGB space
             loss = self.lpips(model_output, target).reshape(-1)
-            if enable_face_weighting and face_bbox is not None and ref_mask is not None:
+            if enable_face_weighting and face_bbox is not None and len(face_bbox) > 0 and ref_mask is not None:
                 additional_loss = self.face_weighting * self.get_face_weighting_loss(face_bbox, loss, ref_mask)
                 loss = loss + additional_loss
             return loss
